@@ -7,40 +7,61 @@ interface VncViewerProps {
   wsUrl: string;
   vncPassword: string;
   onConnect: () => void;
-  onDisconnect: (clean: boolean) => void;
+  onDisconnect: (clean: boolean, reason?: string) => void;
 }
+
+type RfbWithConnectionState = RFB & {
+  _rfbConnectionState?: string;
+};
 
 export default function VncViewer({ wsUrl, vncPassword, onConnect, onDisconnect }: VncViewerProps) {
   const displayRef = useRef<HTMLDivElement>(null);
-  const rfbRef = useRef<RFB | null>(null);
 
   useEffect(() => {
-    if (!displayRef.current) return;
+    const display = displayRef.current;
+    if (!display) return;
 
-    displayRef.current.innerHTML = "";
+    let rfb: RFB | null = null;
+    let disconnected = false;
+    let removeListeners = () => {};
 
-    const rfb = new RFB(displayRef.current, wsUrl, {
-      credentials: { password: vncPassword },
-    });
+    const startTimer = setTimeout(() => {
+      display.innerHTML = "";
 
-    rfb.scaleViewport = true;
-    rfb.resizeSession = true;
-    rfb.qualityLevel = 8;
-    rfb.compressionLevel = 0;
+      const instance = new RFB(display, wsUrl, {
+        credentials: { password: vncPassword },
+      });
+      rfb = instance;
 
-    rfb.addEventListener("connect", onConnect);
-    rfb.addEventListener("credentialsrequired", () => {
-      rfb.sendCredentials({ password: vncPassword });
-    });
-    rfb.addEventListener("disconnect", (e: { detail: { clean: boolean } }) => {
-      onDisconnect(e.detail.clean);
-    });
+      instance.scaleViewport = true;
+      instance.resizeSession = true;
+      instance.qualityLevel = 8;
+      instance.compressionLevel = 0;
 
-    rfbRef.current = rfb;
+      const handleCredentialsRequired = () => {
+        instance.sendCredentials({ password: vncPassword });
+      };
+      const handleDisconnectEvent = (event: { detail: { clean: boolean; reason?: string } }) => {
+        disconnected = true;
+        onDisconnect(event.detail.clean, event.detail.reason);
+      };
+
+      instance.addEventListener("connect", onConnect);
+      instance.addEventListener("credentialsrequired", handleCredentialsRequired);
+      instance.addEventListener("disconnect", handleDisconnectEvent);
+
+      removeListeners = () => {
+        instance.removeEventListener("connect", onConnect);
+        instance.removeEventListener("credentialsrequired", handleCredentialsRequired);
+        instance.removeEventListener("disconnect", handleDisconnectEvent);
+      };
+    }, 0);
 
     return () => {
-      try { rfb.disconnect(); } catch {}
-      rfbRef.current = null;
+      clearTimeout(startTimer);
+      removeListeners();
+      const connectionState = (rfb as RfbWithConnectionState | null)?._rfbConnectionState;
+      if (rfb && !disconnected && connectionState !== "disconnected") rfb.disconnect();
     };
   }, [wsUrl, vncPassword, onConnect, onDisconnect]);
 

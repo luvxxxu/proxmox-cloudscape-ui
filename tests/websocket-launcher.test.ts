@@ -15,8 +15,17 @@ describe("WebSocket relay launcher", () => {
     const manifest = await readManifest();
 
     expect(manifest.scripts?.dev).toContain("server/custom-server.js");
+    expect(manifest.scripts?.["dev:all"]).toContain("server/custom-server.js");
     expect(manifest.scripts?.start).toContain("server/custom-server.js");
     expect(manifest.scripts?.dev).not.toContain("next dev");
     expect(manifest.scripts?.start).not.toContain("next start");
+  });
+
+  it("loads .env files before configuring the WebSocket relay", async () => {
+    const serverSource = await readFile("server/custom-server.js", "utf8");
+
+    expect(serverSource.indexOf("loadEnvConfig(process.cwd(), dev)")).toBeGreaterThan(-1);
+    expect(serverSource.indexOf("loadEnvConfig(process.cwd(), dev)"))
+      .toBeLessThan(serverSource.indexOf("process.env.PROXMOX_HOST"));
   });
 });

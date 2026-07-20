@@ -13,8 +13,11 @@ declare module "novnc" {
     compressionLevel: number;
     viewOnly: boolean;
     addEventListener(type: "connect", listener: () => void): void;
-    addEventListener(type: "disconnect", listener: (e: { detail: { clean: boolean } }) => void): void;
+    addEventListener(type: "disconnect", listener: (e: { detail: { clean: boolean; reason?: string } }) => void): void;
     addEventListener(type: "credentialsrequired", listener: () => void): void;
+    removeEventListener(type: "connect", listener: () => void): void;
+    removeEventListener(type: "disconnect", listener: (e: { detail: { clean: boolean; reason?: string } }) => void): void;
+    removeEventListener(type: "credentialsrequired", listener: () => void): void;
     disconnect(): void;
     sendCredentials(credentials: { password: string }): void;
   }

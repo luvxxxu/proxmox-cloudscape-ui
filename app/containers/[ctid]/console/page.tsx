@@ -2,19 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import dynamic from "next/dynamic";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
+import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import ConsoleViewer from "@/app/components/console-viewer";
+import type { ConsoleMode, ConsoleSession } from "@/app/lib/console-session";
 import { useTranslation } from "@/app/lib/use-translation";
 import { buildWsRelayUrl } from "@/app/lib/ws-relay-url";
-
-const VncViewer = dynamic(() => import("@/app/components/vnc-viewer"), { ssr: false });
 
 interface ClusterContainerResource {
   vmid: number;
@@ -22,11 +22,6 @@ interface ClusterContainerResource {
   name?: string;
   status?: string;
   type?: string;
-}
-
-interface ConfigResponse {
-  proxmoxHost: string;
-  wsRelayPort: string;
 }
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected" | "error";
@@ -38,11 +33,6 @@ async function fetchJson<T>(path: string, errorMessage: string): Promise<T> {
   return (json.data ?? json) as T;
 }
 
-interface VncSession {
-  wsUrl: string;
-  vncPassword: string;
-}
-
 export default function ContainerConsolePage() {
   const { t } = useTranslation();
   const params = useParams<{ ctid: string }>();
@@ -51,16 +41,17 @@ export default function ContainerConsolePage() {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [session, setSession] = useState<VncSession | null>(null);
+  const [mode, setMode] = useState<ConsoleMode>("xterm");
+  const [session, setSession] = useState<ConsoleSession | null>(null);
 
   const vmid = useMemo(() => Number(params.ctid), [params.ctid]);
 
   const handleConnect = useCallback(() => setStatus("connected"), []);
-  const handleDisconnect = useCallback((clean: boolean) => {
+  const handleDisconnect = useCallback((clean: boolean, reason?: string) => {
     if (clean) {
       setStatus("disconnected");
     } else {
-      setError(t("console.vncConnectionLost"));
+      setError(reason ?? t("console.connectionLost"));
       setStatus("error");
     }
   }, [t]);
@@ -75,10 +66,10 @@ export default function ContainerConsolePage() {
 
     const connect = async () => {
       try {
-        const [resources, config] = await Promise.all([
-          fetchJson<ClusterContainerResource[]>("/api/proxmox/cluster/resources?type=vm", t("containers.failedRequest")),
-          fetchJson<ConfigResponse>("/api/config", t("containers.failedRequest")),
-        ]);
+        const resources = await fetchJson<ClusterContainerResource[]>(
+          "/api/proxmox/cluster/resources?type=vm",
+          t("containers.failedRequest"),
+        );
 
         const resource = (resources ?? []).find(
           (r) => r.type === "lxc" && r.vmid === vmid && r.node,
@@ -92,7 +83,7 @@ export default function ContainerConsolePage() {
         const consoleRes = await fetch("/api/console", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ node: resource.node, vmid, vmtype: "lxc" }),
+          body: JSON.stringify({ node: resource.node, vmid, vmtype: "lxc", mode }),
         });
         if (!consoleRes.ok) throw new Error(t("console.failedToConnect"));
         const consoleData = await consoleRes.json();
@@ -104,13 +95,18 @@ export default function ContainerConsolePage() {
           node: resource.node,
           vmid: String(vmid),
           type: "lxc",
-          authTicket: consoleData.authTicket,
-          vncTicket: consoleData.vncTicket,
+          ticket: consoleData.ticket,
           port: String(consoleData.port),
         });
-        const wsUrl = buildWsRelayUrl(window.location, wsParams, config.wsRelayPort);
+        const wsUrl = buildWsRelayUrl(window.location, wsParams);
 
-        setSession({ wsUrl, vncPassword: consoleData.vncTicket });
+        setSession({
+          mode,
+          wsUrl,
+          ticket: consoleData.ticket,
+          user: consoleData.user,
+          password: consoleData.password,
+        });
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : t("console.failedToConnect"));
@@ -122,7 +118,7 @@ export default function ContainerConsolePage() {
     return () => {
       cancelled = true;
     };
-  }, [vmid, attempt, t]);
+  }, [vmid, mode, attempt, t]);
 
   const title = containerName ? `${containerName} (${vmid})` : `CT ${vmid}`;
 
@@ -143,6 +139,15 @@ export default function ContainerConsolePage() {
         variant="h1"
         actions={
           <SpaceBetween size="xs" direction="horizontal">
+            <SegmentedControl
+              selectedId={mode}
+              onChange={({ detail }) => setMode(detail.selectedId as ConsoleMode)}
+              options={[
+                { id: "novnc", text: "noVNC" },
+                { id: "xterm", text: "xterm.js" },
+              ]}
+              label={t("console.viewer")}
+            />
             <StatusIndicator type={statusType}>{statusLabel}</StatusIndicator>
             <Button disabled={status === "connecting"} onClick={() => setAttempt((n) => n + 1)}>{t("console.reconnect")}</Button>
             <Button onClick={() => router.push(`/containers/${vmid}`)}>{t("console.backToContainer")}</Button>
@@ -155,10 +160,9 @@ export default function ContainerConsolePage() {
         {status === "connecting" && !session && (
           <Box textAlign="center" padding="l"><Spinner size="large" /></Box>
         )}
-        {session && (
-          <VncViewer
-            wsUrl={session.wsUrl}
-            vncPassword={session.vncPassword}
+        {session?.mode === mode && (
+          <ConsoleViewer
+            session={session}
             onConnect={handleConnect}
             onDisconnect={handleDisconnect}
           />

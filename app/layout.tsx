@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "@cloudscape-design/global-styles/index.css";
+import "@xterm/xterm/css/xterm.css";
 import AppShell from "./components/app-shell";
 
 export const metadata: Metadata = {

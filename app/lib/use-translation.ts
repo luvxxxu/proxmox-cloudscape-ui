@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback } from "react";
 import { useSettings } from "@/app/components/settings-context";
 import { translations } from "@/app/lib/translations";
 
@@ -18,11 +19,11 @@ function getTranslationValue(source: unknown, path: string): string | undefined 
 export function useTranslation() {
   const { language } = useSettings();
 
-  const t = (key: string) => {
+  const t = useCallback((key: string) => {
     return getTranslationValue(translations[language], key)
       ?? getTranslationValue(translations.en, key)
       ?? key;
-  };
+  }, [language]);
 
   return { language, t };
 }
