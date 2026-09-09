@@ -14,19 +14,20 @@ Caddy mode: --behind-proxy --proxy-bind 10.0.0.20:8080 --proxy-source 10.0.0.10
 In Caddy mode omit UI certificate/key; use the public HTTPS URL for --app-origin.
 --proxmox-ca is optional for a publicly trusted Proxmox HTTPS endpoint.
 Direct HTTPS uses port 443 and requires an existing certificate and unencrypted key.
-Downloads verified Node.js 24.20.0 and Bun 1.3.12, builds as an unprivileged
+Public bootstrap supplies --release-dir with verified prebuilt files and bundled Node.
+Manual source mode downloads Node.js 24.20.0 and Bun 1.3.12, builds as an unprivileged
 user, installs systemd/Nginx, preserves the session secret, and checks health.
 Run again with the same settings to update. No Proxmox host changes are made.
 USAGE
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 proxmox_host='' app_origin='' ca_input='' cert_input='' key_input=''
-behind_proxy=0 proxy_bind='' proxy_source=''
+behind_proxy=0 proxy_bind='' proxy_source='' release_dir=''
 while (($#)); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --behind-proxy) behind_proxy=1; shift ;;
-    --proxmox-host|--app-origin|--proxmox-ca|--tls-cert|--tls-key|--proxy-bind|--proxy-source)
+    --proxmox-host|--app-origin|--proxmox-ca|--tls-cert|--tls-key|--proxy-bind|--proxy-source|--release-dir)
       if (($# < 2)) || [[ -z ${2:-} || $2 == --* ]]; then fail "Missing value for $1"; fi
       case "$1" in
         --proxmox-host) proxmox_host=$2 ;;
@@ -36,6 +37,7 @@ while (($#)); do
         --tls-key) key_input=$2 ;;
         --proxy-bind) proxy_bind=$2 ;;
         --proxy-source) proxy_source=$2 ;;
+        --release-dir) release_dir=$2 ;;
       esac
       shift 2 ;;
     *) fail "Unknown argument: $1 (use --help)" ;;
@@ -122,7 +124,8 @@ cleanup() {
 trap cleanup EXIT
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils rsync nginx openssl python3
+apt-get install -y --no-install-recommends ca-certificates curl rsync nginx openssl python3 libstdc++6 libatomic1
+if [[ -z $release_dir ]]; then apt-get install -y --no-install-recommends git unzip xz-utils; fi
 if ((behind_proxy)); then
   python3 "$source_dir/deploy/configure-proxy.py" render "$app_origin" "$proxy_bind" "$proxy_source" "$source_dir/deploy/nginx.conf" "$work_dir/nginx.conf" "$work_dir/Caddyfile"
 fi
@@ -146,6 +149,12 @@ curl --fail --silent --show-error --noproxy '*' --proto '=https' --connect-timeo
   --cacert "$work_dir/proxmox-ca.pem" "$proxmox_host/api2/json/access/domains" > "$work_dir/domains.json" \
   || fail 'Proxmox TLS/API check failed. Check the CA chain, certificate SAN, DNS and TCP 8006.'
 
+if [[ -n $release_dir ]]; then
+  release_dir=$(realpath -e -- "$release_dir")
+  [[ -f $release_dir/release.json && -x $release_dir/node/bin/node ]] || fail 'Verified release is incomplete.'
+  node_bin="$release_dir/node/bin/node"
+  [[ $("$node_bin" -p 'process.versions.node.split(".")[0]') == 24 ]] || fail 'Release requires Node 24.'
+else
 # Digests from Node's official SHASUMS256.txt and Bun's 1.3.12 GitHub release.
 case $(uname -m) in
   x86_64)
@@ -176,7 +185,9 @@ if [[ ! -x "$tool_dir/bin/bun" ]] || [[ $("$tool_dir/bin/bun" --version) != 1.3.
   install -m 0755 -o root -g root "$work_dir/bun/$bun_asset/bun" "$tool_dir/bin/bun"
 fi
 [[ $("$tool_dir/bin/bun" --version) == 1.3.12 ]] || fail 'Bun version validation failed.'
-env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --input-type=module - "$proxmox_host" "$app_origin" "$source_dir/server/security.js" "$work_dir" <<'VALIDATE'
+node_bin=/usr/local/bin/node
+fi
+env -i PATH=/usr/local/bin:/usr/bin:/bin "$node_bin" --input-type=module - "$proxmox_host" "$app_origin" "$source_dir/server/security.js" "$work_dir" <<'VALIDATE'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -208,6 +219,7 @@ if (!Array.isArray(domains?.data) || domains.data.length === 0 || !domains.data.
 }
 VALIDATE
 
+if [[ -z $release_dir ]]; then
 getent passwd proxmox-ui-build >/dev/null || useradd --system --create-home --home-dir /var/lib/proxmox-ui-build --shell /usr/sbin/nologin proxmox-ui-build
 [[ $(id -u proxmox-ui-build) != 0 && $(id -g proxmox-ui-build) != 0 ]] || fail 'The build user and its primary group must not be root.'
 [[ ! -L /var/lib/proxmox-ui-build ]] || fail 'The build home must not be a symlink.'
@@ -242,6 +254,7 @@ printf 'Installing dependencies and checking/building the application as proxmox
 runuser -u proxmox-ui-build -- env -i HOME=/var/lib/proxmox-ui-build PATH="$tool_dir/bin:/usr/local/bin:/usr/bin:/bin" \
   CI=1 NEXT_TELEMETRY_DISABLED=1 bash -c 'set -euo pipefail; cd "$1"; bun install --frozen-lockfile; bun run check; bun audit; bun run build' bash "$build_dir"
 
+fi
 if ((!behind_proxy)); then
 sed "s/proxmox-ui.example.com/$ui_host/g" "$source_dir/deploy/nginx.conf" > "$work_dir/nginx.conf"
 nginx_version=$(nginx -v 2>&1); nginx_version=${nginx_version##*/}
@@ -279,7 +292,7 @@ fi
 install -m 0644 "$work_dir/nginx.conf" /etc/nginx/sites-available/proxmox-cloudscape
 ln -sfn /etc/nginx/sites-available/proxmox-cloudscape /etc/nginx/sites-enabled/proxmox-cloudscape
 nginx -t
-bash "$source_dir/deploy/install-systemd.sh" --source-dir "$build_dir"
+bash "$source_dir/deploy/install-systemd.sh" --source-dir "${release_dir:-$build_dir}"
 systemctl restart proxmox-cloudscape
 curl --fail --silent --show-error --noproxy '*' --retry 20 --retry-connrefused --retry-delay 2 --max-time 5 \
   http://127.0.0.1:3000/api/health > "$work_dir/health.json"
@@ -296,12 +309,16 @@ curl --fail --silent --show-error --noproxy '*' --retry 20 --retry-all-errors --
   --retry-max-time 30 --connect-timeout 5 --max-time 5 --cacert "$work_dir/fullchain.pem" \
   --resolve "$ui_host:443:127.0.0.1" "$app_origin/api/health" > "$work_dir/https-health.json"
 fi
-env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --input-type=module - "$work_dir" <<'HEALTH'
+env -i PATH=/usr/local/bin:/usr/bin:/bin "$node_bin" --input-type=module - "$work_dir" <<'HEALTH'
 import { readFileSync } from 'node:fs';
 for (const filename of ['health.json', 'https-health.json']) {
   if (JSON.parse(readFileSync(`${process.argv[2]}/${filename}`, 'utf8')).status !== 'ok') throw new Error(`Unexpected application health response: ${filename}`);
 }
 HEALTH
+if [[ -n $release_dir ]]; then
+  install -m 0644 "$release_dir/release.json" /opt/proxmox-cloudscape/current/release.json
+  install -m 0644 "$release_dir/public-release.json" /opt/proxmox-cloudscape/current/public-release.json
+fi
 committed=1
 printf '\nInstalled successfully: %s\nApp: systemctl status proxmox-cloudscape\nLogs: journalctl -u proxmox-cloudscape -n 100 --no-pager\n' "$app_origin"
 if ((behind_proxy)); then

@@ -10,6 +10,8 @@ trap 'docker rm "$container" >/dev/null; rm -rf "$stage"' EXIT
 [[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image") == linux/amd64 ]] || exit 1
 [[ $(docker run --rm --platform linux/amd64 --network none --entrypoint node "$image" -p 'process.versions.node.split(".")[0]') == 24 ]] || exit 1
 docker cp "$container:/app/." "$stage/"
+mkdir -p "$stage/node/bin"
+docker cp "$container:/usr/local/bin/node" "$stage/node/bin/node"
 rm -rf "$stage/.next/cache"
 mkdir -p "$stage/.next/cache" build
 node --input-type=module - "$stage/release.json" <<'JS'
@@ -22,4 +24,4 @@ docker run --rm --platform linux/amd64 --network none --user 0:0 --read-only \
   --cap-drop ALL --security-opt no-new-privileges \
   -v "$stage:/runtime:ro" -v "$PWD/build:/output" --entrypoint tar "$image" \
   --hard-dereference --owner=0 --group=0 -czf /output/runtime.tar.gz -C /runtime \
-  .next node_modules public server package.json next.config.mjs release.json
+  .next node_modules public server package.json next.config.mjs release.json node

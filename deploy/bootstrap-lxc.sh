@@ -21,12 +21,66 @@ main() {
   printf '\nCloudscape UI 자동 설치 — 기존 Caddy에서 HTTPS 처리\n'
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl git python3 iproute2
-  printf '\n설치 코드를 GitHub에서 내려받습니다.\n'
-  git -c core.hooksPath=/dev/null clone --depth 1 --branch main -- \
-    https://github.com/luvxxxu/proxmox-cloudscape-ui.git "$stage/source"
+  apt-get install -y --no-install-recommends ca-certificates curl python3 iproute2
+  printf '\n공개 안정 릴리스를 내려받고 무결성을 확인합니다. GitHub 계정은 필요 없습니다.\n'
+  python3 - "$stage" <<'FETCH_RELEASE'
+import hashlib, json, pathlib, re, shutil, sys, tarfile, time, urllib.error, urllib.request
+root = pathlib.Path(sys.argv[1])
+repository = 'luvxxxu/proxmox-cloudscape-ui'
+class HTTPS(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, url):
+        if not url.startswith('https://'): raise ValueError('HTTPS redirect required')
+        return super().redirect_request(req, fp, code, msg, headers, url)
+def fetch(url, path, limit):
+    for attempt in range(3):
+        try:
+            with urllib.request.build_opener(HTTPS()).open(url, timeout=60) as response, path.open('wb') as output:
+                size = 0
+                while chunk := response.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > limit: raise ValueError('Download too large')
+                    output.write(chunk)
+            return
+        except urllib.error.HTTPError as error:
+            if error.code == 404: sys.exit('공개 안정 릴리스가 아직 없습니다. 설치를 중단합니다. PAT는 필요 없습니다.')
+            if error.code not in (429, 500, 502, 503, 504): raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError): pass
+        if attempt < 2: time.sleep(2 ** attempt)
+    sys.exit('릴리스 서버 연결에 실패했습니다. 네트워크를 확인한 뒤 같은 명령으로 재시도하세요.')
+fetch(f'https://github.com/{repository}/releases/latest/download/release.json', root / 'manifest.json', 65536)
+manifest = json.loads((root / 'manifest.json').read_text())
+if (manifest.get('repository') != repository or manifest.get('schema') != 1
+        or not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', manifest.get('version', ''))):
+    sys.exit('Invalid release manifest')
+source = manifest.get('source', {})
+if (source.get('name') != 'source.tar.gz' or type(source.get('size')) is not int
+        or not 0 < source['size'] <= 64 * 1024 * 1024
+        or not re.fullmatch(r'[a-f0-9]{64}', source.get('sha256', ''))): sys.exit('Invalid source metadata')
+archive = root / 'source.tar.gz'
+fetch(f'https://github.com/{repository}/releases/download/{manifest["version"]}/source.tar.gz', archive, source['size'])
+if archive.stat().st_size != source['size'] or hashlib.sha256(archive.read_bytes()).hexdigest() != source['sha256']:
+    sys.exit('Source checksum mismatch')
+destination = root / 'source'; destination.mkdir(mode=0o700)
+seen = set(); total = 0
+with tarfile.open(archive, 'r:gz') as bundle:
+    for item in bundle:
+        name = pathlib.PurePosixPath(item.name)
+        if not name.parts and item.isdir(): continue
+        if (not name.parts or name.is_absolute() or '..' in name.parts or name.as_posix() in seen
+                or not (item.isfile() or item.isdir())): sys.exit('Unsafe source archive')
+        seen.add(name.as_posix()); total += item.size
+        if len(seen) > 10000 or total > 256 * 1024 * 1024: sys.exit('Source archive too large')
+        target = destination / name; target.parent.mkdir(parents=True, exist_ok=True)
+        if item.isdir(): target.mkdir(exist_ok=True)
+        else:
+            with bundle.extractfile(item) as incoming, target.open('xb') as output: shutil.copyfileobj(incoming, output)
+sys.path.insert(0, str(destination / 'deploy'))
+import public_release
+public_release.validate(manifest)
+public_release.runtime(manifest, root)
+print('다운로드 완료:', manifest['version'])
+FETCH_RELEASE
   helper="$stage/source/deploy/configure-proxy.py"
-  [[ -f $helper ]] || fail 'GitHub main에 자동 설치 파일이 아직 없습니다.'
   bash "$stage/source/deploy/check-lxc-sandbox.sh"
   while true; do
     ask '기존 Proxmox 접속 주소 (예: https://pve.example.com 또는 192.168.1.10:8006): '
@@ -78,21 +132,14 @@ main() {
     if proxy_ip=$(python3 "$helper" private-ip "$answer"); then break; fi
   done
   printf '\n설치: %s → Caddy → %s:8080 → 앱\nProxmox API: %s\n' "$app_origin" "$bind_ip" "$pve_origin"
-  printf '최초 설치는 검사와 빌드를 포함합니다. 콘솔을 닫지 말고 기다려 주세요.\n'
+  printf '검사가 끝난 실행 파일을 설치합니다. LXC에서는 빌드나 bun audit를 실행하지 않습니다.\n'
   bash "$stage/source/deploy/install-lxc.sh" --behind-proxy \
     --proxmox-host "$pve_origin" --app-origin "$app_origin" --proxmox-ca "$ca" \
-    --proxy-bind "$bind_ip:8080" --proxy-source "$proxy_ip"
+    --proxy-bind "$bind_ip:8080" --proxy-source "$proxy_ip" --release-dir "$stage/runtime"
   printf '\n앱 설치가 완료됐습니다. 위 Caddy 설정을 기존 Caddyfile에 추가해야 외부 접속이 됩니다.\n'
   printf '다시 보기: cat /etc/proxmox-cloudscape/Caddyfile.example\n'
   printf '8080은 Caddy와 컨테이너 사이의 내부 연결 전용입니다. 인터넷에 포트 전달하지 마세요.\n'
-  ask 'GitHub Actions 자동 업데이트도 설정할까요? 토큰이 필요합니다 [y/N]: '
-  if [[ $answer == y || $answer == Y ]]; then
-    bash "$stage/source/deploy/enable-auto-update.sh" <&3
-  else
-    install -d -m 0700 /root/proxmox-cloudscape-setup
-    cp -a "$stage/source/deploy" /root/proxmox-cloudscape-setup/
-    install -m 0644 "$stage/source/.env.local.example" /root/proxmox-cloudscape-setup/.env.local.example
-    printf '나중에 활성화: bash /root/proxmox-cloudscape-setup/deploy/enable-auto-update.sh\n'
-  fi
+  bash "$stage/source/deploy/enable-auto-update.sh"
+  printf '공개 안정 버전 자동 업데이트가 켜졌습니다. GitHub PAT는 필요 없습니다.\n'
 }
 main "$@"

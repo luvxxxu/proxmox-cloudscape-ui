@@ -20,11 +20,11 @@ jobs:
           bun-version: '1.3.12'
       - run: bun install --frozen-lockfile
       - run: bun run check
-      - run: bun audit
+      # Audit is a release gate in CI, never a dependency of an end-user install.
+      - run: bash scripts/audit-dependencies.sh
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - run: bash scripts/check-bootstrap.sh
       - run: bash scripts/check-deployment.sh
-      - run: bun run build
       - run: docker build -t proxmox-cloudscape-ui:test .
       - run: bunx playwright install --with-deps chromium
       - run: bun run test:smoke
@@ -34,36 +34,62 @@ jobs:
         if: always()
         with:
           name: browser-smoke
-          overwrite: true
           path: test-results/
           if-no-files-found: ignore
-      - name: Package tested Linux runtime
-        if: github.event_name == 'push'
-        run: bash scripts/package-runtime.sh proxmox-cloudscape-ui:test
-      - name: Verify pull deployment and rollback
-        if: github.event_name == 'push'
-        run: bash scripts/check-pull-deployment.sh
+      - name: Package tested runtime and source
+        run: |
+          bash scripts/package-runtime.sh proxmox-cloudscape-ui:test
+          bun run package:source
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export RELEASE_VERSION="$GITHUB_REF_NAME"
+          else
+            export RELEASE_VERSION=v0.0.0
+          fi
+          python3 scripts/package-release.py
+      - run: bash scripts/check-pull-deployment.sh
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push'
         with:
-          name: runtime-linux-x64-${{ github.sha }}
-          overwrite: true
-          path: build/runtime.tar.gz
+          name: release-candidate
+          path: |
+            build/runtime.tar.gz
+            build/proxmox-cloudscape-ui-source.tar.gz
+            build/runtime-linux-x64.tar.gz
+            build/source.tar.gz
+            build/release.json
+            build/install.sh
           compression-level: 0
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: error
   lxc-installer:
+    needs: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       matrix:
         debian: ['12', '13']
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/download-artifact@v4
         with:
-          bun-version: '1.3.12'
-      - run: bun run package:source
+          name: release-candidate
+          path: build
       - run: bash scripts/check-lxc-install.sh
         env:
           LXC_TEST_DEBIAN_VERSION: ${{ matrix.debian }}
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, lxc-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: build
+      - name: Publish complete stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: bash scripts/publish-release.sh

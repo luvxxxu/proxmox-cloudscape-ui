@@ -1,5 +1,5 @@
 [Unit]
-Description=Pull verified Cloudscape deployment from GitHub Actions
+Description=Pull verified Cloudscape deployment from public GitHub Releases
 Wants=network-online.target
 After=network-online.target
 

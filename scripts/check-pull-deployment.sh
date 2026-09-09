@@ -35,7 +35,7 @@ case "$1" in
     set +a
     export NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3000
     cd /opt/proxmox-cloudscape/current
-    setpriv --reuid=proxmox-ui --regid=proxmox-ui --init-groups /usr/local/bin/node server/custom-server.js >>/tmp/app.log 2>&1 &
+    setpriv --reuid=proxmox-ui --regid=proxmox-ui --init-groups /opt/proxmox-cloudscape/current/node/bin/node server/custom-server.js >>/tmp/app.log 2>&1 &
     echo "$!" >/run/app.pid ;;
   *) exit 1 ;;
 esac

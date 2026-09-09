@@ -1,6 +1,6 @@
 # Caddy를 사용하는 LXC 자동 설치
 
-Debian 12 또는 13 **amd64 비특권 컨테이너**를 생성하고, Options → Features → Nesting을 켠 뒤 시작합니다. 처음 검사·빌드할 때는 2코어·4GiB를 권장하며 설치 후 실제 사용량을 보고 줄일 수 있습니다. 고정 내부 IP 또는 DHCP 예약을 사용하세요.
+Debian 12 또는 13 **amd64 비특권 컨테이너**를 생성하고, Options → Features → Nesting을 켠 뒤 시작합니다. 1~2코어·1~2GiB 메모리를 시작값으로 삼고 실제 사용량에 맞게 조절하세요. 최소 사양을 실측 보장하는 값은 아닙니다. LXC에서 빌드하지 않습니다. 고정 내부 IP 또는 DHCP 예약을 사용하세요.
 
 이 설치는 **기존 별도 Caddy가 HTTPS를 처리하는 구성**입니다. 앱 컨테이너에서 인증서를 발급하거나 Mac에 CA를 등록할 필요가 없습니다. 앱·Nginx·systemd 설치는 자동이고, 다른 컨테이너의 Caddy 설정은 마지막에 출력되는 사이트 블록을 추가합니다. 외부 Caddy 설정과 DNS를 설치기가 임의로 변경하지 않습니다.
 
@@ -9,7 +9,7 @@ Debian 12 또는 13 **amd64 비특권 컨테이너**를 생성하고, Options �
 Proxmox 웹 화면에서 **새 컨테이너 → Console**을 열고 root로 로그인합니다. 이미 노드 Shell에서 `pct enter 컨테이너ID`로 들어왔다면 그 화면에서 실행해도 됩니다. 프롬프트가 Proxmox 호스트 이름이 아니라 새 컨테이너 이름인지 확인하세요.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/luvxxxu/proxmox-cloudscape-ui/main/deploy/bootstrap-lxc.sh -o /root/cloudscape-install.sh && bash /root/cloudscape-install.sh
+curl -fsSL https://github.com/luvxxxu/proxmox-cloudscape-ui/releases/latest/download/install.sh -o /root/cloudscape-install.sh && bash /root/cloudscape-install.sh
 ```
 
 `curl: command not found`라면 먼저 아래 명령을 실행한 뒤 다시 시도합니다.
@@ -77,14 +77,12 @@ Docker 등으로 운영하는 Caddy는 해당 환경의 설정 반영 절차를 
 
 브라우저에서 `https://pve.lxvu.dev`로 접속합니다. Proxmox의 계정·비밀번호로 로그인하고 콘솔 연결도 확인하세요. 설치기가 검사하는 것은 내부 서비스까지이며, 다른 LXC의 Caddy와 실제 외부 접속 성공은 별도 확인이 필요합니다.
 
-## GitHub 자동 업데이트
+## 자동 업데이트
 
-설치 마지막 질문에서 `y`를 입력하면 기존 자동 업데이트 설정을 이어서 실행합니다. GitHub의 이 저장소에 대한 **Actions: Read / Contents: Read** 토큰이 필요하며 입력은 화면에 표시되지 않습니다. 토큰이 없으면 Enter로 건너뛰고 나중에 다음 명령으로 설정할 수 있습니다.
+설치 마지막에 공개 안정 릴리스 자동 업데이트가 기본으로 켜집니다. **GitHub 계정·PAT 입력은 없습니다.** 앱과 Node는 CI에서 검사·빌드한 파일을 사용하며, LXC에서 Bun·테스트·빌드·취약점 조회를 실행하지 않습니다.
 
-```bash
-bash /root/proxmox-cloudscape-setup/deploy/enable-auto-update.sh
-```
+약 15분마다 새 안정 릴리스를 확인합니다. 새 버전의 시작/상태 검사에 실패하면 이전 앱과 Node로 복원합니다. 일반 코드 push는 CI 검사만 실행하고, 제작자가 버전 태그를 push해 릴리스를 게시하면 사용자에게 배포됩니다. [제작자 배포와 사용자 업데이트 안내](automatic-deployment.ko.md)를 참고하세요.
 
-`main`에 push → 전체 CI 성공 → 약 2분 간격으로 LXC가 빌드 결과를 받아 업데이트합니다. 최초 설치는 LXC에서 빌드하므로 시간이 걸리지만 반복 업데이트는 LXC에서 빌드하지 않습니다. CI가 실패하면 현재 버전을 유지합니다. 자세한 토큰·로그·복구 절차는 [자동 배포 안내](automatic-deployment.ko.md)를 참고하세요.
+아직 공개 안정 릴리스가 없다면 설치는 중단됩니다. 원본 소스로 돌아가 빌드하거나 인증 검사를 생략하지 않습니다. 제작자의 첫 릴리스 검사가 끝나고 공개된 뒤 다시 실행하세요.
 
-기존 외부 Caddy의 인증서 갱신은 Caddy가 담당합니다. Debian·Node 보안 업데이트와 GitHub 토큰 갱신은 별도로 관리해야 합니다.
+기존 외부 Caddy의 인증서 갱신은 Caddy가 담당합니다. Debian·Nginx·Caddy의 보안 업데이트는 별도로 관리해야 합니다.

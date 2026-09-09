@@ -8,8 +8,6 @@ if [[ $(id -u) -ne 0 ]]; then
   exit 1
 fi
 command -v rsync >/dev/null || { echo 'Install rsync first: apt-get install rsync' >&2; exit 1; }
-[[ -x /usr/local/bin/node ]] || { echo 'Node.js 24 must be installed at /usr/local/bin/node.' >&2; exit 1; }
-[[ $(/usr/local/bin/node -p 'process.versions.node.split(".")[0]') == 24 ]] || { echo 'Node.js 24 LTS is required.' >&2; exit 1; }
 trusted_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 source_dir=$trusted_root
 if (( $# )); then
@@ -35,6 +33,15 @@ validate_runtime_tree() {
     return 1
   fi
 }
+validate_bundled_node() {
+  local directory=$1
+  [[ -d $directory/node && ! -L $directory/node && -d $directory/node/bin && ! -L $directory/node/bin && -f $directory/node/bin/node && ! -L $directory/node/bin/node && -x $directory/node/bin/node ]] || { echo 'Unsafe bundled Node runtime.' >&2; return 1; }
+}
+if [[ -e $source_dir/node || -L $source_dir/node ]]; then
+  validate_bundled_node "$source_dir"
+else
+  [[ -x /usr/local/bin/node && $(/usr/local/bin/node -p 'process.versions.node.split(".")[0]') == 24 ]] || { echo 'Node.js 24 is required.' >&2; exit 1; }
+fi
 validate_runtime_tree "$source_dir"
 for part in deploy/proxmox-cloudscape.service .env.local.example; do
   [[ -f "$trusted_root/$part" && ! -L "$trusted_root/$part" ]] || { echo "Missing or unsafe trusted installation input: $part" >&2; exit 1; }
@@ -51,18 +58,29 @@ release_dir="/opt/proxmox-cloudscape/releases/$release"
 # modes have been normalized, preventing source races from changing root paths.
 install -d -m 0700 "$release_dir"
 install -d -m 0755 /etc/proxmox-cloudscape
-for part in .next node_modules public server next.config.mjs package.json; do
+runtime_parts=(.next node_modules public server next.config.mjs package.json)
+if [[ -d $source_dir/node ]]; then
+  runtime_parts+=(node)
+fi
+for part in "${runtime_parts[@]}"; do
   rsync -a --chown=root:root --exclude='.env*' "$source_dir/$part" "$release_dir/"
 done
 validate_runtime_tree "$release_dir"
+if [[ -d $source_dir/node ]]; then validate_bundled_node "$release_dir"; fi
 # The service can read code but cannot replace it, even if source modes were permissive.
-for part in .next node_modules public server next.config.mjs package.json; do
+for part in "${runtime_parts[@]}"; do
   chmod -R u=rwX,go=rX "$release_dir/$part"
 done
 install -d -o proxmox-ui -g proxmox-ui -m 0700 "$release_dir/.next/cache"
 chown -R -h proxmox-ui:proxmox-ui "$release_dir/.next/cache"
 chmod 0755 "$release_dir"
+if [[ -d $release_dir/node ]]; then
+  [[ $(runuser -u proxmox-ui -- "$release_dir/node/bin/node" -p 'process.versions.node.split(".")[0]') == 24 ]] || { echo 'Bundled Node 24 validation failed.' >&2; exit 1; }
+fi
 install -m 0644 "$trusted_root/deploy/proxmox-cloudscape.service" /etc/systemd/system/proxmox-cloudscape.service
+if [[ -d $release_dir/node ]]; then
+  sed -i 's|ExecStart=/usr/local/bin/node |ExecStart=/opt/proxmox-cloudscape/current/node/bin/node |' /etc/systemd/system/proxmox-cloudscape.service
+fi
 if [[ ! -e /etc/proxmox-cloudscape/environment ]]; then
   install -m 0600 "$trusted_root/.env.local.example" /etc/proxmox-cloudscape/environment
 fi

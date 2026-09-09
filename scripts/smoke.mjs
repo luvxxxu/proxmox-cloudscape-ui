@@ -66,7 +66,7 @@ try {
   };
   const captureDesktop = async (filename) => {
     await assertDesktopNavigation();
-    await page.screenshot({ path: path.join(artifacts, filename), fullPage: true, animations: 'disabled' });
+    await page.screenshot({ path: path.join(artifacts, filename), fullPage: false, animations: 'disabled' });
     await assertDesktopNavigation();
   };
   await page.goto(`${origin}/login`);
