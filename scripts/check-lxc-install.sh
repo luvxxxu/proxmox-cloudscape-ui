@@ -22,7 +22,7 @@ apt-get update -qq
 apt-get install -y --no-install-recommends ca-certificates openssl python3 systemd shellcheck >/dev/null
 mkdir -p /root/source /root/fixtures /run/systemd/system /usr/local/bin
 tar -xzf /input/source.tar.gz -C /root/source
-shellcheck /root/source/deploy/install-lxc.sh /root/source/deploy/check-lxc-sandbox.sh /root/source/deploy/install-systemd.sh
+shellcheck /root/source/deploy/bootstrap-lxc.sh /root/source/deploy/install-lxc.sh /root/source/deploy/check-lxc-sandbox.sh /root/source/deploy/install-systemd.sh
 bash -n /root/source/deploy/install-lxc.sh
 openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=Fixture-CA \
   -keyout /root/fixtures/ca.key -out /root/fixtures/ca.pem >/dev/null 2>&1
@@ -145,4 +145,22 @@ if bash deploy/install-lxc.sh "${install_args[@]}"; then echo 'Expected start fa
 [[ $(sha256sum /etc/proxmox-cloudscape/environment) == "$config_sha" ]]
 curl --fail --silent --retry 10 --retry-connrefused --retry-delay 1 --cacert /root/fixtures/ca.pem --resolve ui.test:443:127.0.0.1 https://ui.test/api/health
 printf '\nPASS: update preserves secret, previous links survive, failed start restores application/configuration\n'
+# Switch to an external TLS terminator without supplying any UI certificates.
+proxy_args=(--behind-proxy --proxmox-host https://localhost:18006 --app-origin https://ui.test \
+  --proxmox-ca /root/fixtures/ca.pem --proxy-bind 127.0.0.1:8080 --proxy-source 127.0.0.3)
+bash deploy/install-lxc.sh "${proxy_args[@]}"
+proxy_release=$(readlink /opt/proxmox-cloudscape/current)
+[[ $(sha256sum /etc/proxmox-cloudscape/environment) == "$config_sha" ]]
+[[ $(curl --silent -H 'Host: ui.test' --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/api/health) == 200 ]]
+[[ $(curl --silent --interface 127.0.0.3 -H 'Host: ui.test' --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/api/health) == 200 ]]
+[[ $(curl --silent --interface 127.0.0.2 -H 'Host: ui.test' --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/api/health) == 403 ]]
+[[ $(curl --silent -H 'Host: wrong.test' --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/api/health) == 421 ]]
+[[ $(curl --silent -H 'Host: ui.test' --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/api/proxmox/nodes) == 401 ]]
+nginx_sha=$(sha256sum /etc/nginx/sites-available/proxmox-cloudscape)
+touch /run/fail-next-app-start
+if bash deploy/install-lxc.sh "${proxy_args[@]}"; then echo 'Expected proxy-mode start failure.' >&2; exit 1; fi
+[[ $(readlink /opt/proxmox-cloudscape/current) == "$proxy_release" ]]
+[[ $(sha256sum /etc/nginx/sites-available/proxmox-cloudscape) == "$nginx_sha" ]]
+curl --fail --silent --retry 10 --retry-connrefused -H 'Host: ui.test' http://127.0.0.1:8080/api/health
+printf '\nPASS: Caddy upstream, allowed/denied peers, host validation, API denial and rollback\n'
 CHECK_LXC

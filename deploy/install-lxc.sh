@@ -10,7 +10,10 @@ Usage: bash deploy/install-lxc.sh \
   --proxmox-ca /root/proxmox-ca.pem \
   --tls-cert /root/fullchain.pem --tls-key /root/privkey.pem
 
-The HTTPS UI uses port 443. Supply an existing certificate and unencrypted key.
+Caddy mode: --behind-proxy --proxy-bind 10.0.0.20:8080 --proxy-source 10.0.0.10
+In Caddy mode omit UI certificate/key; use the public HTTPS URL for --app-origin.
+--proxmox-ca is optional for a publicly trusted Proxmox HTTPS endpoint.
+Direct HTTPS uses port 443 and requires an existing certificate and unencrypted key.
 Downloads verified Node.js 24.20.0 and Bun 1.3.12, builds as an unprivileged
 user, installs systemd/Nginx, preserves the session secret, and checks health.
 Run again with the same settings to update. No Proxmox host changes are made.
@@ -18,10 +21,12 @@ USAGE
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 proxmox_host='' app_origin='' ca_input='' cert_input='' key_input=''
+behind_proxy=0 proxy_bind='' proxy_source=''
 while (($#)); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --proxmox-host|--app-origin|--proxmox-ca|--tls-cert|--tls-key)
+    --behind-proxy) behind_proxy=1; shift ;;
+    --proxmox-host|--app-origin|--proxmox-ca|--tls-cert|--tls-key|--proxy-bind|--proxy-source)
       if (($# < 2)) || [[ -z ${2:-} || $2 == --* ]]; then fail "Missing value for $1"; fi
       case "$1" in
         --proxmox-host) proxmox_host=$2 ;;
@@ -29,12 +34,14 @@ while (($#)); do
         --proxmox-ca) ca_input=$2 ;;
         --tls-cert) cert_input=$2 ;;
         --tls-key) key_input=$2 ;;
+        --proxy-bind) proxy_bind=$2 ;;
+        --proxy-source) proxy_source=$2 ;;
       esac
       shift 2 ;;
     *) fail "Unknown argument: $1 (use --help)" ;;
   esac
 done
-[[ -n $proxmox_host && -n $app_origin && -n $ca_input && -n $cert_input && -n $key_input ]] || { usage >&2; exit 1; }
+[[ -n $proxmox_host && -n $app_origin ]] || { usage >&2; exit 1; }
 [[ $(id -u) == 0 ]] || fail 'Run inside the LXC as root (pct enter CTID).'
 [[ $(uname -s) == Linux ]] || fail 'This installer runs inside a Linux LXC.'
 [[ ! -d /etc/pve && ! -x /usr/bin/pveversion ]] || fail 'Do not run this on the Proxmox host. Enter the application LXC first.'
@@ -47,9 +54,18 @@ source /etc/os-release
 [[ $app_origin =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail '--app-origin must be https://DNS-NAME or https://IPv4, port 443, without a trailing slash.'
 [[ $proxmox_host =~ ^https://([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$ ]] || fail '--proxmox-host must be an HTTPS origin without a trailing slash, credentials, path, or query.'
 ui_host=${app_origin#https://}
-for input in "$ca_input" "$cert_input" "$key_input"; do
-  [[ -f $input && -s $input ]] || fail "Missing certificate/key file: $input"
-done
+if ((behind_proxy)); then
+  [[ -n $proxy_bind && -n $proxy_source ]] || fail 'Behind-proxy mode requires --proxy-bind PRIVATE_IPV4:PORT and --proxy-source CADDY_IPV4.'
+  [[ -z $cert_input && -z $key_input ]] || fail 'Caddy handles TLS; omit --tls-cert and --tls-key in behind-proxy mode.'
+else
+  [[ -z $proxy_bind && -z $proxy_source ]] || fail 'Proxy settings require --behind-proxy.'
+  for input in "$cert_input" "$key_input"; do
+    [[ -f $input && -s $input ]] || fail "Missing certificate/key file: $input"
+  done
+fi
+if [[ -n $ca_input ]]; then
+  [[ -f $ca_input && -s $ca_input ]] || fail "Missing CA file: $ca_input"
+fi
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 [[ $source_dir != / && $source_dir != /tmp ]] || fail 'Place the source in its own project directory.'
 # Sources must be independent of directories that this installer creates,
@@ -106,11 +122,14 @@ cleanup() {
 trap cleanup EXIT
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils rsync nginx openssl
-install -m 0644 "$ca_input" "$work_dir/proxmox-ca.pem"
+apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils rsync nginx openssl python3
+if ((behind_proxy)); then
+  python3 "$source_dir/deploy/configure-proxy.py" render "$app_origin" "$proxy_bind" "$proxy_source" "$source_dir/deploy/nginx.conf" "$work_dir/nginx.conf" "$work_dir/Caddyfile"
+fi
+install -m 0644 "${ca_input:-/etc/ssl/certs/ca-certificates.crt}" "$work_dir/proxmox-ca.pem"
+if ((!behind_proxy)); then
 install -m 0644 "$cert_input" "$work_dir/fullchain.pem"
 install -m 0600 "$key_input" "$work_dir/privkey.pem"
-openssl x509 -in "$work_dir/proxmox-ca.pem" -noout -checkend 0 >/dev/null || fail 'Proxmox CA is invalid or expired.'
 openssl x509 -in "$work_dir/fullchain.pem" -noout -checkend 86400 >/dev/null || fail 'UI certificate is invalid or expires in less than one day.'
 if [[ $ui_host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   openssl x509 -in "$work_dir/fullchain.pem" -noout -checkip "$ui_host" >/dev/null || fail 'UI certificate does not cover APP_ORIGIN IP.'
@@ -120,6 +139,7 @@ fi
 openssl x509 -in "$work_dir/fullchain.pem" -pubkey -noout > "$work_dir/cert-public.pem"
 openssl pkey -in "$work_dir/privkey.pem" -passin pass: -pubout > "$work_dir/key-public.pem" 2>/dev/null || fail 'UI key must be a valid, unencrypted private key.'
 cmp -s "$work_dir/cert-public.pem" "$work_dir/key-public.pem" || fail 'UI certificate and private key do not match.'
+fi
 # /version requires a ticket. /access/domains is explicitly public in PVE's
 # HTTP authentication handler, so installation never needs account credentials.
 curl --fail --silent --show-error --noproxy '*' --proto '=https' --connect-timeout 10 --max-time 30 \
@@ -222,10 +242,12 @@ printf 'Installing dependencies and checking/building the application as proxmox
 runuser -u proxmox-ui-build -- env -i HOME=/var/lib/proxmox-ui-build PATH="$tool_dir/bin:/usr/local/bin:/usr/bin:/bin" \
   CI=1 NEXT_TELEMETRY_DISABLED=1 bash -c 'set -euo pipefail; cd "$1"; bun install --frozen-lockfile; bun run check; bun audit; bun run build' bash "$build_dir"
 
+if ((!behind_proxy)); then
 sed "s/proxmox-ui.example.com/$ui_host/g" "$source_dir/deploy/nginx.conf" > "$work_dir/nginx.conf"
 nginx_version=$(nginx -v 2>&1); nginx_version=${nginx_version##*/}
 if dpkg --compare-versions "$nginx_version" lt 1.25.1; then
   sed -i -e 's/listen 443 ssl;/listen 443 ssl http2;/' -e '/^[[:space:]]*http2 on;/d' "$work_dir/nginx.conf"
+fi
 fi
 install -d -m 0755 /etc/proxmox-cloudscape /etc/nginx/sites-available /etc/nginx/sites-enabled
 install -d -m 0750 /etc/ssl/proxmox-cloudscape
@@ -234,9 +256,11 @@ prior_release=$(readlink /opt/proxmox-cloudscape/current || true)
 systemctl is-active --quiet proxmox-cloudscape && app_was_active=1
 systemctl is-active --quiet nginx && nginx_was_active=1
 destinations=(/etc/proxmox-cloudscape/environment /etc/proxmox-cloudscape/proxmox-ca.pem \
-  /etc/ssl/proxmox-cloudscape/fullchain.pem /etc/ssl/proxmox-cloudscape/privkey.pem \
   /etc/nginx/sites-available/proxmox-cloudscape /etc/nginx/sites-enabled/proxmox-cloudscape \
   /etc/systemd/system/proxmox-cloudscape.service /opt/proxmox-cloudscape/previous)
+if ((!behind_proxy)); then
+  destinations+=(/etc/ssl/proxmox-cloudscape/fullchain.pem /etc/ssl/proxmox-cloudscape/privkey.pem)
+fi
 for index in "${!destinations[@]}"; do
   target=${destinations[$index]}
   [[ ! -d $target || -L $target ]] || fail "Refusing to replace a directory: $target"
@@ -248,8 +272,10 @@ switching=1
 for target in "${destinations[@]}"; do rm -f -- "$target"; done
 install -m 0600 "$work_dir/environment" /etc/proxmox-cloudscape/environment
 install -m 0644 "$work_dir/proxmox-ca.pem" /etc/proxmox-cloudscape/proxmox-ca.pem
+if ((!behind_proxy)); then
 install -m 0644 "$work_dir/fullchain.pem" /etc/ssl/proxmox-cloudscape/fullchain.pem
 install -m 0600 "$work_dir/privkey.pem" /etc/ssl/proxmox-cloudscape/privkey.pem
+fi
 install -m 0644 "$work_dir/nginx.conf" /etc/nginx/sites-available/proxmox-cloudscape
 ln -sfn /etc/nginx/sites-available/proxmox-cloudscape /etc/nginx/sites-enabled/proxmox-cloudscape
 nginx -t
@@ -259,11 +285,17 @@ curl --fail --silent --show-error --noproxy '*' --retry 20 --retry-connrefused -
   http://127.0.0.1:3000/api/health > "$work_dir/health.json"
 systemctl enable nginx
 if ((nginx_was_active)); then systemctl reload nginx; else systemctl start nginx; fi
+if ((behind_proxy)); then
+  curl --fail --silent --show-error --noproxy '*' --retry 20 --retry-all-errors --retry-delay 1 \
+    --retry-max-time 30 --connect-timeout 5 --max-time 5 -H "Host: $ui_host" \
+    "http://127.0.0.1:${proxy_bind##*:}/api/health" > "$work_dir/https-health.json"
+else
 # Nginx reload acknowledges the signal before new listeners/certificates are
 # ready. Retry with full TLS verification while old workers are replaced.
 curl --fail --silent --show-error --noproxy '*' --retry 20 --retry-all-errors --retry-delay 1 \
   --retry-max-time 30 --connect-timeout 5 --max-time 5 --cacert "$work_dir/fullchain.pem" \
   --resolve "$ui_host:443:127.0.0.1" "$app_origin/api/health" > "$work_dir/https-health.json"
+fi
 env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --input-type=module - "$work_dir" <<'HEALTH'
 import { readFileSync } from 'node:fs';
 for (const filename of ['health.json', 'https-health.json']) {
@@ -272,4 +304,11 @@ for (const filename of ['health.json', 'https-health.json']) {
 HEALTH
 committed=1
 printf '\nInstalled successfully: %s\nApp: systemctl status proxmox-cloudscape\nLogs: journalctl -u proxmox-cloudscape -n 100 --no-pager\n' "$app_origin"
-printf 'Configure certificate renewal separately. Validate login and a disposable resource before production use.\n'
+if ((behind_proxy)); then
+  install -m 0644 "$work_dir/Caddyfile" /etc/proxmox-cloudscape/Caddyfile.example
+  printf 'Internal installation verified. Add this site to your existing Caddy configuration:\n'
+  cat /etc/proxmox-cloudscape/Caddyfile.example
+  printf 'External HTTPS is not verified yet. Configure Caddy/DNS, then check login and consoles.\n'
+else
+  printf 'Configure certificate renewal separately. Validate login and a disposable resource before production use.\n'
+fi

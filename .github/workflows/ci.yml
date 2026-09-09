@@ -22,6 +22,7 @@ jobs:
       - run: bun run check
       - run: bun audit
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - run: bash scripts/check-bootstrap.sh
       - run: bash scripts/check-deployment.sh
       - run: bun run build
       - run: docker build -t proxmox-cloudscape-ui:test .

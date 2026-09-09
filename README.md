@@ -11,6 +11,8 @@ Cloudscape Design System으로 구현한 Proxmox VE 관리 인터페이스입니
 
 ## 설치
 
+**기존 Caddy를 사용하는 경우: [명령 하나로 LXC 자동 설치](docs/quick-install-caddy.ko.md)**. 컨테이너 Console에서 설치기를 실행하면 주소 입력, 내부 IP 확인, 앱 설치와 Caddy 설정 생성을 안내합니다.
+
 **[GitHub Actions 자동 배포](docs/automatic-deployment.ko.md)**: push 후 CI에서 검사·빌드하고, LXC가 성공한 최신 커밋의 소스와 실행 파일을 받아 업데이트합니다. LXC의 반복 빌드가 필요 없으며 실패 시 이전 릴리스를 복원합니다.
 
 **[Proxmox LXC 설치 안내](docs/installation-lxc.ko.md)**를 먼저 읽으세요. 비특권 Debian LXC에서 설치 스크립트가 Node.js·Bun·systemd·Nginx를 준비하고 HTTPS 서비스를 구성합니다. 컨테이너 생성, 현재 소스 전달, 인증서 준비, 업데이트와 복구까지 설명합니다.

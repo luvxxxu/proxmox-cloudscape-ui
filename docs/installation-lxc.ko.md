@@ -1,5 +1,7 @@
 # Proxmox LXC에 설치하기
 
+**별도 Caddy로 외부 접속하는 경우에는 [Caddy용 자동 설치](quick-install-caddy.ko.md)를 사용하세요.** 아래는 LXC의 Nginx가 직접 HTTPS를 처리하는 수동 설정 절차입니다.
+
 Proxmox 안에 **Debian 13 비특권 LXC**를 만들고, 그 안에서 `deploy/install-lxc.sh`를 실행합니다. Debian 12도 지원합니다. 설치 스크립트가 Node.js 24.20.0, Bun 1.3.12, 애플리케이션 빌드, systemd 서비스와 Nginx HTTPS 설정을 준비합니다.
 
 기존 Proxmox 관리 화면과 8006 포트는 유지됩니다. 설치 명령은 새 LXC 안에서 실행하며, Proxmox 호스트에 Node.js나 Nginx를 설치하지 않습니다. **실제 Proxmox LXC에서의 부팅·설치·운영 검증은 아직 수행하지 않았습니다.** 아래 절차의 서비스 검사와 마지막 실제 접속 검증을 완료한 뒤 운영에 투입하세요.

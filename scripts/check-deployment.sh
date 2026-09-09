@@ -7,7 +7,9 @@ command -v openssl >/dev/null || { echo 'OpenSSL is required.' >&2; exit 1; }
 fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/proxmox-deployment-check.XXXXXX")
 trap 'rm -rf "$fixture_dir"' EXIT
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=proxmox-ui.example.com   -keyout "$fixture_dir/privkey.pem" -out "$fixture_dir/fullchain.pem" >/dev/null 2>&1
-docker compose -f "$repo_dir/compose.yaml" config --no-env-resolution --quiet
+cp "$repo_dir/compose.yaml" "$fixture_dir/compose.yaml"
+cp "$repo_dir/.env.local.example" "$fixture_dir/.env.production"
+docker compose --project-directory "$fixture_dir" -f "$fixture_dir/compose.yaml" config --quiet
 docker run --rm -i --network none \
   -v "$repo_dir/deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
   -v "$fixture_dir:/etc/ssl/proxmox-cloudscape:ro" nginx:alpine sh -s <<'CHECK_NGINX'
