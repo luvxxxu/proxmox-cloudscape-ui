@@ -20,7 +20,7 @@ writeFileSync(process.argv[2], JSON.stringify({commit:process.env.GITHUB_SHA, re
 JS
 # Use GNU tar from the tested Debian image, also when invoked from macOS.
 # Flatten hard links while preserving dependency symlinks inside the runtime.
-docker run --rm --platform linux/amd64 --network none --user 0:0 --read-only \
+docker run --rm --platform linux/amd64 --network none --user "$(id -u):$(id -g)" --read-only \
   --cap-drop ALL --security-opt no-new-privileges \
   -v "$stage:/runtime:ro" -v "$PWD/build:/output" --entrypoint tar "$image" \
   --hard-dereference --owner=0 --group=0 -czf /output/runtime.tar.gz -C /runtime \
