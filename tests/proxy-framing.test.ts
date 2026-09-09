@@ -76,7 +76,9 @@ describe('Proxmox HTTP request framing using real Node fetch', () => {
     expect(response.status).toBe(200);
     expect(received[0].headers['content-length']).toBe(String(bytes.length));
     expect(received[0].headers['transfer-encoding']).toBeUndefined();
-    expect(received[0].body).toEqual(bytes);
+    // Compare every byte natively; recursively comparing millions of Buffer
+    // properties can exceed the test deadline on small CI runners.
+    expect(received[0].body.equals(bytes)).toBe(true);
   });
   it('preserves a known-length VM creation body without re-encoding it', async () => {
     const body = 'vmid=101&description=%ED%95%9C%EA%B8%80&cores=2';
