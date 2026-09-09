@@ -1,3 +1,5 @@
+// @vitest-environment node
+import { createPveSession } from "@/app/lib/pve-session";
 import { createServer, type Server } from "node:http";
 import { createRequire } from "node:module";
 import { afterEach, describe, expect, it } from "vitest";
@@ -52,7 +54,7 @@ describe("WebSocket relay", () => {
   });
 
   it("reads the Proxmox auth ticket from the encoded session cookie", () => {
-    const session = encodeURIComponent(JSON.stringify({ ticket: "PVE:root@pam:secret" }));
+    const session = encodeURIComponent(createPveSession({ ticket: "PVE:root@pam:secret", username: "root@pam", csrfToken: "csrf" }));
     expect(parseSessionTicket(`other=value; pve-session=${session}`)).toBe("PVE:root@pam:secret");
     expect(parseSessionTicket("pve-session=invalid-json")).toBeNull();
   });
@@ -85,7 +87,7 @@ describe("WebSocket relay", () => {
     const relayPort = await listen(relayServer);
 
     const authTicket = "PVE:root@pam:auth";
-    const sessionCookie = encodeURIComponent(JSON.stringify({ ticket: authTicket }));
+    const sessionCookie = encodeURIComponent(createPveSession({ ticket: authTicket, username: "root@pam", csrfToken: "csrf" }));
     const client = new WebSocket(
       `ws://127.0.0.1:${relayPort}/ws?node=pve-1&type=shell&ticket=terminal-ticket&port=5901`,
       "binary",

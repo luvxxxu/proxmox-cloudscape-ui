@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const { WebSocketServer, WebSocket } = require("ws");
+const { parseSession, isAllowedOrigin: checkOrigin } = require("./security.js");
 
 const MAX_PENDING_BYTES = 1024 * 1024;
 
@@ -23,8 +24,7 @@ function parseSessionTicket(cookieHeader) {
 
     try {
       const value = decodeURIComponent(cookie.slice(separator + 1).trim());
-      const session = JSON.parse(value);
-      return typeof session?.ticket === "string" ? session.ticket : null;
+      return parseSession(value)?.ticket ?? null;
     } catch {
       return null;
     }
@@ -34,16 +34,7 @@ function parseSessionTicket(cookieHeader) {
 }
 
 function isAllowedOrigin(req) {
-  const origin = req.headers.origin;
-  if (!origin) return false;
-
-  try {
-    const originHost = new URL(origin).host;
-    const forwardedHost = String(req.headers["x-forwarded-host"] ?? "").split(",")[0].trim();
-    return [req.headers.host, forwardedHost].filter(Boolean).includes(originHost);
-  } catch {
-    return false;
-  }
+  return checkOrigin(req.headers.origin, req.headers.host, Boolean(req.socket?.encrypted));
 }
 
 function parseRelayRequest(req) {
@@ -87,13 +78,16 @@ function relayConnection(client, proxmoxHost, params, authTicket) {
   const finishClient = (code, reason) => {
     if (finished) return;
     finished = true;
-    if (client.readyState === WebSocket.OPEN) client.close(code, reason);
+    if (client.readyState === WebSocket.OPEN) client.close(code, String(reason).slice(0, 80));
   };
 
   try {
     upstream = new WebSocket(buildProxmoxWebSocketUrl(proxmoxHost, params), "binary", {
       headers: { Cookie: `PVEAuthCookie=${authTicket}` },
-      rejectUnauthorized: false,
+      rejectUnauthorized: true,
+      handshakeTimeout: 15000,
+      maxPayload: MAX_PENDING_BYTES,
+      perMessageDeflate: false,
     });
   } catch {
     finishClient(1011, "Invalid Proxmox WebSocket configuration");
@@ -102,6 +96,7 @@ function relayConnection(client, proxmoxHost, params, authTicket) {
 
   client.on("message", (data, isBinary) => {
     if (upstreamOpen && upstream.readyState === WebSocket.OPEN) {
+      if (upstream.bufferedAmount > MAX_PENDING_BYTES * 8) { finishClient(1013, "Console connection is too slow"); upstream.terminate(); return; }
       upstream.send(data, { binary: isBinary });
       return;
     }
@@ -127,6 +122,7 @@ function relayConnection(client, proxmoxHost, params, authTicket) {
   });
 
   upstream.on("message", (data, isBinary) => {
+    if (client.bufferedAmount > MAX_PENDING_BYTES * 8) { finishClient(1013, "Console connection is too slow"); upstream.terminate(); return; }
     if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
   });
 
@@ -144,7 +140,7 @@ function relayConnection(client, proxmoxHost, params, authTicket) {
 
   upstream.on("error", (error) => {
     if (finished) return;
-    console.error(`[ws-relay] Proxmox console connection failed: ${error.message}`);
+    console.error(`[ws-relay] Proxmox console connection failed (${error.code || "connection error"})`);
     finishClient(1011, "Proxmox console connection failed");
   });
 
@@ -162,7 +158,15 @@ function relayConnection(client, proxmoxHost, params, authTicket) {
 }
 
 function createWebSocketRelay(proxmoxHost) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PENDING_BYTES, perMessageDeflate: false });
+  const heartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      if (client.isAlive === false) { client.terminate(); continue; }
+      client.isAlive = false;
+      client.ping();
+    }
+  }, 30000);
+  heartbeat.unref();
 
   return {
     handleUpgrade(req, socket, head) {
@@ -186,11 +190,16 @@ function createWebSocketRelay(proxmoxHost) {
         return;
       }
 
+      if (wss.clients.size >= Number(process.env.MAX_CONSOLE_CONNECTIONS || 128)) { rejectUpgrade(socket, 503, "Service Unavailable"); return; }
       wss.handleUpgrade(req, socket, head, (client) => {
+        client.isAlive = true;
+        client.on("pong", () => { client.isAlive = true; });
         relayConnection(client, proxmoxHost, params, authTicket);
       });
     },
     close() {
+      clearInterval(heartbeat);
+      for (const client of wss.clients) client.terminate();
       wss.close();
     },
   };

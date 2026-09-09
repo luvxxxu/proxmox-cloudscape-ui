@@ -1,13 +1,36 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockFetch = vi.fn();
-vi.stubGlobal("fetch", mockFetch);
+
 
 const { apiFetch, onSessionExpired } = await import("@/app/lib/api-client");
 
 describe("apiFetch", () => {
   beforeEach(() => {
+    vi.stubGlobal("fetch", mockFetch);
     vi.clearAllMocks();
+  });
+
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it.each(["POST", "PUT", "DELETE", "PATCH"])("never retries %s on server error", async (method) => {
+    mockFetch.mockResolvedValueOnce(new Response("ambiguous failure", { status: 503 }));
+    const response = await apiFetch("/api/test", { method, maxRetries: 5 });
+    expect(response.status).toBe(503);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries a mutation after a network failure", async () => {
+    mockFetch.mockRejectedValueOnce(new Error("Network error"));
+    await expect(apiFetch("/api/test", { method: "POST" })).rejects.toThrow("Network error");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors aborted requests without sending them", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(apiFetch("/api/test", { signal: controller.signal })).rejects.toBeDefined();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("returns response on success", async () => {
