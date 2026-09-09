@@ -1,45 +1,50 @@
 {
   "name": "cloudscape-proxmox-ui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
-    "dev": "NODE_TLS_REJECT_UNAUTHORIZED=0 node server/custom-server.js",
-    "dev:all": "NODE_TLS_REJECT_UNAUTHORIZED=0 node server/custom-server.js",
+    "dev": "node server/custom-server.js",
+    "dev:all": "node server/custom-server.js",
     "build": "next build",
-    "start": "NODE_ENV=production NODE_TLS_REJECT_UNAUTHORIZED=0 node server/custom-server.js",
-    "lint": "eslint",
+    "start": "NODE_ENV=production node server/custom-server.js",
+    "lint": "eslint --max-warnings=0",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "next typegen && tsc --noEmit",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "package:source": "bun scripts/package-source.mjs",
+    "schema:update": "bun scripts/update-api-schema.mjs",
+    "test:smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@cloudscape-design/board-components": "^3.0.167",
-    "@cloudscape-design/collection-hooks": "^1.0.90",
-    "@cloudscape-design/components": "^3.0.1274",
-    "@cloudscape-design/design-tokens": "^3.0.79",
-    "@cloudscape-design/global-styles": "^1.0.57",
-    "@next/env": "16.2.4",
+    "@cloudscape-design/board-components": "^3.0.226",
+    "@cloudscape-design/collection-hooks": "^1.0.107",
+    "@cloudscape-design/components": "^3.0.1365",
+    "@cloudscape-design/design-tokens": "^3.0.111",
+    "@cloudscape-design/global-styles": "^1.0.68",
+    "@next/env": "16.3.4",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "next": "16.2.4",
-    "novnc": "github:novnc/noVNC",
+    "next": "16.3.4",
+    "novnc": "github:novnc/noVNC#8e1ebdf",
     "react": "19.2.4",
     "react-dom": "19.2.4",
-    "ws": "^8.20.0"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
-    "@svgr/webpack": "^8.1.0",
-    "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
+    "@playwright/test": "^1",
+    "@testing-library/jest-dom": "^6.10.0",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^24",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
     "@types/ws": "^8.18.1",
     "babel-plugin-react-compiler": "1.0.0",
-    "eslint": "^9",
-    "eslint-config-next": "16.2.4",
-    "jsdom": "^29.0.2",
-    "typescript": "^5",
-    "vitest": "^4.1.4"
+    "eslint": "^9.39.5",
+    "eslint-config-next": "16.3.4",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   },
   "ignoreScripts": [
     "sharp",
@@ -48,5 +53,13 @@
   "trustedDependencies": [
     "sharp",
     "unrs-resolver"
-  ]
+  ],
+  "packageManager": "bun@1.3.12",
+  "engines": {
+    "node": ">=24 <25",
+    "bun": ">=1.3.12"
+  },
+  "overrides": {
+    "postcss": "8.5.28"
+  }
 }

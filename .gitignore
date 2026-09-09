@@ -39,3 +39,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Deployment secrets and local verification outputs
+.env.*
+!.env.local.example
+deploy/certs/
+deploy/data/
+playwright-report/
+test-results/
+__pycache__/
+*.pyc
+auto-update.json

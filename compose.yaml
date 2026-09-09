@@ -1,0 +1,30 @@
+services:
+  app:
+    image: proxmox-cloudscape-ui:${IMAGE_TAG:-local}
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env.production
+    environment:
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+      NODE_EXTRA_CA_CERTS: /run/certs/proxmox-ca.pem
+    volumes:
+      - type: bind
+        source: ./deploy/certs/proxmox-ca.pem
+        target: /run/certs/proxmox-ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:3000:3000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

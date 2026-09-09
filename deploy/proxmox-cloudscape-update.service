@@ -1,0 +1,17 @@
+[Unit]
+Description=Pull verified Cloudscape deployment from GitHub Actions
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/proxmox-cloudscape-updater/pull-update.py
+TimeoutStartSec=15min
+TimeoutStopSec=120s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

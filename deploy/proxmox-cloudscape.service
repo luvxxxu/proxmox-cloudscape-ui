@@ -1,0 +1,35 @@
+[Unit]
+Description=Cloudscape interface for Proxmox VE
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=proxmox-ui
+Group=proxmox-ui
+WorkingDirectory=/opt/proxmox-cloudscape/current
+EnvironmentFile=/etc/proxmox-cloudscape/environment
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+Environment=NODE_EXTRA_CA_CERTS=/etc/proxmox-cloudscape/proxmox-ca.pem
+ExecStart=/usr/local/bin/node server/custom-server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/proxmox-cloudscape/current/.next/cache
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

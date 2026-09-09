@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for verified Cloudscape updates
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=proxmox-cloudscape-update.service
+
+[Install]
+WantedBy=timers.target
