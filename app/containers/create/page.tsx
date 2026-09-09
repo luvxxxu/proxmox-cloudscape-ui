@@ -1,5 +1,8 @@
 "use client";
 
+import { requestResource } from "@/app/lib/resource-request";
+import { isStorageActive, isValidVmid, isIntegerInRange } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
@@ -18,10 +21,6 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Toggle from "@cloudscape-design/components/toggle";
 import Wizard, { type WizardProps } from "@cloudscape-design/components/wizard";
 
-interface ProxmoxResponse<T> {
-  data: T;
-}
-
 interface NodeSummary {
   node: string;
   status: string;
@@ -34,6 +33,8 @@ interface ClusterNextId {
 interface StorageSummary {
   storage: string;
   content?: string;
+  active?: number;
+  enabled?: number;
 }
 
 interface StorageContentItem {
@@ -51,22 +52,7 @@ interface ValidationResult {
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as ProxmoxResponse<T> | null;
-
-  if (!response.ok) {
-    const errorMessage =
-      typeof json?.data === "string"
-        ? json.data
-        : `Request failed with status ${response.status}`;
-    throw new Error(errorMessage);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path, init);
 }
 
 function optionLabel(option: SelectProps.Option | null) {
@@ -82,7 +68,7 @@ function yesNo(value: boolean) {
 }
 
 function storageSupportsContent(storage: StorageSummary, contentType: string) {
-  return (storage.content ?? "")
+  return isStorageActive(storage) && (storage.content ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .includes(contentType);
@@ -146,21 +132,14 @@ export default function CreateContainerPage() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadInitialData();
   }, [loadInitialData]);
 
   useEffect(() => {
     const node = optionValue(selectedNode);
 
-    if (!node) {
-      setTemplateOptions([]);
-      setSelectedTemplate(null);
-      setStorageOptions([]);
-      setSelectedStorage(null);
-      setBridgeOptions([]);
-      setSelectedBridge(null);
-      return;
-    }
+    if (!node) return;
 
     let cancelled = false;
 
@@ -207,7 +186,7 @@ export default function CreateContainerPage() {
         });
 
         const networkBridgeOptions = (networks ?? [])
-          .filter((network) => network.type === "bridge")
+          .filter((network) => network.type === "bridge" || network.type === "OVSBridge")
           .map((network) => ({ label: network.iface, value: network.iface }))
           .sort((left, right) => optionLabel(left).localeCompare(optionLabel(right)));
 
@@ -251,13 +230,14 @@ export default function CreateContainerPage() {
   }, [selectedNode]);
 
   const validateForm = useCallback((): ValidationResult | null => {
+    if (nodeResourcesLoading) return { message: "Wait for node resources to finish loading.", stepIndex: 0 };
     if (!containerName.trim()) {
       return { message: "Container Name is required.", stepIndex: 0 };
     }
     if (!optionValue(selectedNode)) {
       return { message: "Node is required.", stepIndex: 0 };
     }
-    if (!containerId.trim()) {
+    if (!isValidVmid(containerId)) {
       return { message: "Container ID is required.", stepIndex: 0 };
     }
     if (!optionValue(selectedTemplate)) {
@@ -269,11 +249,13 @@ export default function CreateContainerPage() {
     if (!optionValue(selectedBridge)) {
       return { message: "Network Bridge is required.", stepIndex: 3 };
     }
+    if (!isIntegerInRange(cores, 1) || !isIntegerInRange(memory, 16) || !isIntegerInRange(swap, 0)) return { message: "CPU cores and memory must be positive integers; swap must be a non-negative integer.", stepIndex: 2 };
+    if (!Number.isFinite(Number(diskSize)) || Number(diskSize) <= 0) return { message: "Disk size must be a positive number.", stepIndex: 2 };
     if (!rootPassword) {
       return { message: "Root Password is required.", stepIndex: 3 };
     }
     return null;
-  }, [containerId, containerName, rootPassword, selectedBridge, selectedNode, selectedStorage, selectedTemplate]);
+  }, [containerId, containerName, cores, memory, swap, diskSize, nodeResourcesLoading, rootPassword, selectedBridge, selectedNode, selectedStorage, selectedTemplate]);
 
   const handleSubmit = useCallback(async () => {
     const validationResult = validateForm();
@@ -321,7 +303,7 @@ export default function CreateContainerPage() {
       setSubmitting(true);
       setError(null);
 
-      const response = await fetch(`/api/proxmox/nodes/${node}/lxc`, {
+      await requestResource<string>(`/api/proxmox/nodes/${node}/lxc`, {
         method: "POST",
         cache: "no-store",
         headers: {
@@ -329,16 +311,6 @@ export default function CreateContainerPage() {
         },
         body: body.toString(),
       });
-
-      const json = (await response.json().catch(() => null)) as ProxmoxResponse<unknown> | null;
-
-      if (!response.ok) {
-        const errorMessage =
-          typeof json?.data === "string"
-            ? json.data
-            : `Request failed with status ${response.status}`;
-        throw new Error(errorMessage);
-      }
 
       setFlashbarItems([
         {
@@ -349,9 +321,7 @@ export default function CreateContainerPage() {
         },
       ]);
 
-      window.setTimeout(() => {
-        router.push("/containers");
-      }, 2000);
+      router.push("/containers");
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to create container");
     } finally {
@@ -459,7 +429,7 @@ export default function CreateContainerPage() {
               <FormField label="Node" description="Only online nodes are available for launching." stretch>
                 <Select
                   selectedOption={selectedNode}
-                  onChange={({ detail }) => setSelectedNode(detail.selectedOption)}
+                  onChange={({ detail }) => { setSelectedNode(detail.selectedOption); setNodeResourcesLoading(false); setTemplateOptions([]); setSelectedTemplate(null); setStorageOptions([]); setSelectedStorage(null); setBridgeOptions([]); setSelectedBridge(null); }}
                   options={nodeOptions}
                   placeholder="Choose a node"
                   loadingText="Loading nodes"
@@ -652,7 +622,7 @@ export default function CreateContainerPage() {
   return (
     <SpaceBetween size="l">
       <Header variant="h1">Create container</Header>
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry.id !== item.id))) }))} /> : null}
       {error ? (
         <Alert type="error" header="Unable to create container">
           {error}
@@ -677,7 +647,7 @@ export default function CreateContainerPage() {
             stepNumberLabel: (n) => `Step ${n}`,
             collapsedStepsLabel: (n, total) => `Step ${n} of ${total}`,
           }}
-          isLoadingNextStep={submitting}
+          isLoadingNextStep={submitting || nodeResourcesLoading}
         />
       )}
     </SpaceBetween>

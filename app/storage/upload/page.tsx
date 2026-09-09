@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource } from "@/app/lib/resource-request";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -12,10 +14,8 @@ import ProgressBar from "@cloudscape-design/components/progress-bar";
 import Select, { type SelectProps } from "@cloudscape-design/components/select";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import { useTranslation } from "@/app/lib/use-translation";
-
-interface ProxmoxResponse<T> {
-  data?: T;
-}
+import { createStorageUploadForm, isStorageActive, resourceErrorMessage } from "@/app/lib/resource-api";
+import FileUpload from "@cloudscape-design/components/file-upload";
 
 interface NodeSummary {
   node: string;
@@ -25,6 +25,8 @@ interface NodeSummary {
 interface StorageSummary {
   storage: string;
   content?: string;
+  active?: number;
+  enabled?: number;
 }
 
 function optionValue(option: SelectProps.Option | null) {
@@ -32,24 +34,15 @@ function optionValue(option: SelectProps.Option | null) {
 }
 
 async function fetchProxmox<T>(path: string): Promise<T> {
-  const response = await fetch(path, { cache: "no-store" });
-  const json = (await response.json().catch(() => null)) as ProxmoxResponse<T> | null;
-
-  if (!response.ok) {
-    const errorMessage =
-      typeof json?.data === "string" ? json.data : String(response.status);
-    throw new Error(errorMessage);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path);
 }
 
 function parseUploadError(status: number, responseText: string) {
-  const json = JSON.parse(responseText) as ProxmoxResponse<string>;
-  if (typeof json.data === "string" && json.data.trim()) {
-    return json.data;
+  try {
+    return resourceErrorMessage(JSON.parse(responseText), `HTTP ${status}`);
+  } catch {
+    return `HTTP ${status}`;
   }
-  return String(status);
 }
 
 export default function StorageUploadPage() {
@@ -62,7 +55,7 @@ export default function StorageUploadPage() {
   const [nodeOptions, setNodeOptions] = useState<ReadonlyArray<SelectProps.Option>>([]);
   const [storageOptions, setStorageOptions] = useState<StorageSummary[]>([]);
   const [selectedNode, setSelectedNode] = useState<SelectProps.Option | null>(null);
-  const [selectedStorage, setSelectedStorage] = useState<SelectProps.Option | null>(null);
+  const [storageSelection, setSelectedStorage] = useState<SelectProps.Option | null>(null);
   const [selectedContentType, setSelectedContentType] = useState<SelectProps.Option | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [flashbarItems, setFlashbarItems] = useState<FlashbarProps.MessageDefinition[]>([]);
@@ -93,17 +86,14 @@ export default function StorageUploadPage() {
   }, [t]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadNodes();
   }, [loadNodes]);
 
   useEffect(() => {
     const node = optionValue(selectedNode);
 
-    if (!node) {
-      setStorageOptions([]);
-      setSelectedStorage(null);
-      return;
-    }
+    if (!node) return;
 
     let cancelled = false;
 
@@ -118,7 +108,7 @@ export default function StorageUploadPage() {
 
         const supportedStorages = (storages ?? []).filter((storage) => {
           const content = storage.content?.split(",").map((entry) => entry.trim()) ?? [];
-          return content.includes("iso") || content.includes("vztmpl");
+          return isStorageActive(storage) && (content.includes("iso") || content.includes("vztmpl"));
         });
 
         setStorageOptions(supportedStorages);
@@ -165,15 +155,7 @@ export default function StorageUploadPage() {
       .map((storage) => ({ label: storage.storage, value: storage.storage }));
   }, [selectedContentType, storageOptions]);
 
-  useEffect(() => {
-    setSelectedStorage((current) => {
-      if (!current) {
-        return null;
-      }
-
-      return filteredStorageOptions.some((option) => option.value === current.value) ? current : null;
-    });
-  }, [filteredStorageOptions]);
+  const selectedStorage = filteredStorageOptions.find((option) => option.value === storageSelection?.value) ?? null;
 
   const canSubmit =
     !uploading &&
@@ -191,12 +173,8 @@ export default function StorageUploadPage() {
     const storage = optionValue(selectedStorage);
     const contentType = optionValue(selectedContentType);
 
-    const formData = new FormData();
-    formData.append("content", contentType);
-    formData.append("filename", selectedFile.name);
-    formData.append("file", selectedFile, selectedFile.name);
-
     try {
+      const formData = createStorageUploadForm(selectedFile, contentType);
       setUploading(true);
       setProgress(0);
       setError(null);
@@ -233,6 +211,8 @@ export default function StorageUploadPage() {
           reject(new Error(t("storage.uploadFailed")));
         });
 
+        request.timeout = 2 * 60 * 60 * 1000;
+        request.addEventListener("timeout", () => reject(new Error(t("storage.uploadFailed"))));
         request.open("POST", `/api/proxmox/nodes/${node}/storage/${storage}/upload`);
         request.send(formData);
       });
@@ -259,7 +239,7 @@ export default function StorageUploadPage() {
   return (
     <SpaceBetween size="l">
       <Header variant="h1">{t("storage.uploadIsoTemplate")}</Header>
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry.id !== item.id))) }))} /> : null}
       {error ? (
         <Alert type="error" header={t("storage.uploadFailed")}>
           {error}
@@ -270,7 +250,7 @@ export default function StorageUploadPage() {
           <FormField label={t("storage.node")}>
             <Select
               selectedOption={selectedNode}
-              onChange={({ detail }) => setSelectedNode(detail.selectedOption)}
+              onChange={({ detail }) => { setSelectedNode(detail.selectedOption); setStorageOptions([]); setSelectedStorage(null); }}
               options={nodeOptions}
               placeholder={t("storage.selectNode")}
               statusType={loadingNodes ? "loading" : "finished"}
@@ -304,23 +284,18 @@ export default function StorageUploadPage() {
           </FormField>
 
           <FormField label={t("storage.file")}>
-            <Box padding="m" fontSize="body-m">
-              <div
-                style={{
-                  borderRadius: "8px",
-                  border: "1px solid #879596",
-                  padding: "12px",
-                }}
-              >
-                <input
-                  key={selectedFile ? selectedFile.name : "no-file"}
-                  type="file"
-                  onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
-                  disabled={uploading}
-                  style={{ width: "100%" }}
-                />
-              </div>
-            </Box>
+            {uploading ? <Box>{selectedFile?.name}</Box> : <FileUpload
+              value={selectedFile ? [selectedFile] : []}
+              onChange={({ detail }) => setSelectedFile(detail.value[0] ?? null)}
+              accept={optionValue(selectedContentType) === "iso" ? ".iso,.img" : ".tar.gz,.tar.xz,.tar.zst,.tar.lzo"}
+              showFileSize
+              i18nStrings={{
+                uploadButtonText: () => t("storage.file"),
+                dropzoneText: () => t("storage.file"),
+                removeFileAriaLabel: () => t("common.delete"),
+                errorIconAriaLabel: t("common.error"),
+              }}
+            />}
           </FormField>
 
           {uploading ? <ProgressBar value={progress} label={t("storage.uploadProgress")} /> : null}

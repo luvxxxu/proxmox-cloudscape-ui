@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import Board, {
   type BoardProps,
 } from "@cloudscape-design/board-components/board";
 import BoardItem from "@cloudscape-design/board-components/board-item";
-import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
@@ -19,49 +18,9 @@ import Button from "@cloudscape-design/components/button";
 import Spinner from "@cloudscape-design/components/spinner";
 import Alert from "@cloudscape-design/components/alert";
 import AreaChart from "@cloudscape-design/components/area-chart";
-import PieChart from "@cloudscape-design/components/pie-chart";
 import Popover from "@cloudscape-design/components/popover";
 import { useTranslation } from "@/app/lib/use-translation";
-
-interface PveNode {
-  node: string;
-  status: "online" | "offline" | "unknown";
-  cpu: number;
-  maxcpu: number;
-  mem: number;
-  maxmem: number;
-  disk: number;
-  maxdisk: number;
-  uptime: number;
-}
-
-interface PveResource {
-  id: string;
-  type: "qemu" | "lxc" | "node" | "storage" | "sdn";
-  node: string;
-  name?: string;
-  vmid?: number;
-  status: string;
-  cpu?: number;
-  maxcpu?: number;
-  mem?: number;
-  maxmem?: number;
-  disk?: number;
-  maxdisk?: number;
-  uptime?: number;
-  template?: number;
-}
-
-interface PveRrdPoint {
-  time: number;
-  cpu?: number;
-  memused?: number;
-  memtotal?: number;
-  netin?: number;
-  netout?: number;
-}
-
-type RrdTimeframe = "hour" | "day" | "week" | "month" | "year";
+import { clusterCpuPercent, useDashboardData, type PveNode, type PveResource, type PveRrdPoint, type RrdTimeframe } from "@/app/lib/dashboard-data";
 
 function interpolate(template: string, values: Record<string, string | number>) {
   return Object.entries(values).reduce(
@@ -80,10 +39,10 @@ function getStatusLabel(t: (key: string) => string, status: string) {
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.max(0, Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k))));
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
@@ -97,117 +56,8 @@ function formatUptime(seconds: number): string {
 }
 
 function pct(used: number, max: number): number {
-  if (max === 0) return 0;
-  return Math.round((used / max) * 100);
-}
-
-interface DashboardData {
-  nodes: PveNode[];
-  resources: PveResource[];
-  rrd: PveRrdPoint[];
-}
-
-function useDashboardData() {
-  const [data, setData] = useState<DashboardData | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [rrdTimeframe, setRrdTimeframe] = useState<RrdTimeframe>("hour");
-
-  const load = useCallback(async (tf: RrdTimeframe) => {
-    try {
-      const [nodesRes, resourcesRes] = await Promise.all([
-        fetch("/api/proxmox/nodes"),
-        fetch("/api/proxmox/cluster/resources"),
-      ]);
-
-      if (!nodesRes.ok || !resourcesRes.ok) {
-        throw new Error(
-          `API error: nodes=${nodesRes.status}, resources=${resourcesRes.status}`,
-        );
-      }
-
-      const nodesJson = await nodesRes.json();
-      const resourcesJson = await resourcesRes.json();
-
-      const nodes: PveNode[] = nodesJson.data ?? [];
-      const resources: PveResource[] = resourcesJson.data ?? [];
-
-      const rrdResponses = await Promise.all(
-        nodes
-          .filter((n) => n.status === "online")
-          .map((n) =>
-            fetch(
-              `/api/proxmox/nodes/${n.node}/rrddata?timeframe=${tf}&cf=AVERAGE`,
-            ),
-          ),
-      );
-
-      const rrdArrays = await Promise.all(
-        rrdResponses.map(async (res) => {
-          if (!res.ok) return [];
-          const json = await res.json();
-          return (json.data ?? []) as PveRrdPoint[];
-        }),
-      );
-
-      const timeMap = new Map<
-        number,
-        {
-          cpu: number[];
-          memUsed: number[];
-          memTotal: number[];
-          netin: number[];
-          netout: number[];
-        }
-      >();
-      for (const points of rrdArrays) {
-        for (const p of points) {
-          if (p.cpu === undefined) continue;
-          const existing = timeMap.get(p.time) ?? {
-            cpu: [],
-            memUsed: [],
-            memTotal: [],
-            netin: [],
-            netout: [],
-          };
-          existing.cpu.push(p.cpu ?? 0);
-          existing.memUsed.push(p.memused ?? 0);
-          existing.memTotal.push(p.memtotal ?? 0);
-          existing.netin.push(p.netin ?? 0);
-          existing.netout.push(p.netout ?? 0);
-          timeMap.set(p.time, existing);
-        }
-      }
-
-      const rrd: PveRrdPoint[] = Array.from(timeMap.entries())
-        .sort(([a], [b]) => a - b)
-        .map(([time, v]) => ({
-          time,
-          cpu: v.cpu.reduce((s, c) => s + c, 0) / v.cpu.length,
-          memused: v.memUsed.reduce((s, c) => s + c, 0),
-          memtotal: v.memTotal.reduce((s, c) => s + c, 0),
-          netin: v.netin.reduce((s, c) => s + c, 0),
-          netout: v.netout.reduce((s, c) => s + c, 0),
-        }));
-
-      setData({ nodes, resources, rrd });
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch data");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load(rrdTimeframe);
-    const interval = setInterval(() => load(rrdTimeframe), 30000);
-    return () => clearInterval(interval);
-  }, [load, rrdTimeframe]);
-
-  const refresh = useCallback(() => load(rrdTimeframe), [load, rrdTimeframe]);
-
-  return { data, error, loading, refresh, rrdTimeframe, setRrdTimeframe };
+  if (!Number.isFinite(used) || !Number.isFinite(max) || max <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((used / max) * 100)));
 }
 
 function ClusterOverviewContent({
@@ -306,7 +156,7 @@ function ClusterOverviewContent({
         {
           label: t("common.clusterHealth"),
           value:
-            onlineNodes === nodes.length ? (
+            nodes.length === 0 ? <StatusIndicator type="warning">{t("common.noDataAvailable")}</StatusIndicator> : onlineNodes === nodes.length ? (
               <StatusIndicator type="success">{t("common.allNodesOnline")}</StatusIndicator>
             ) : (
               <StatusIndicator type="warning">
@@ -325,10 +175,7 @@ function ResourceUsageContent({ nodes }: { nodes: PveNode[] }) {
   const usedMem = nodes.reduce((s, n) => s + n.mem, 0);
   const totalDisk = nodes.reduce((s, n) => s + n.maxdisk, 0);
   const usedDisk = nodes.reduce((s, n) => s + n.disk, 0);
-  const avgCpu =
-    nodes.length > 0
-      ? Math.round((nodes.reduce((s, n) => s + n.cpu, 0) / nodes.length) * 100)
-      : 0;
+  const avgCpu = clusterCpuPercent(nodes);
 
   const memPct = pct(usedMem, totalMem);
   const diskPct = pct(usedDisk, totalDisk);
@@ -403,11 +250,11 @@ function CpuMemoryChartContent({
     return d.toLocaleDateString([], { month: "short", day: "numeric" });
   };
 
-  const cpuData = rrd.map((p) => ({
+  const cpuData = rrd.filter((point) => Number.isFinite(point.cpu)).map((p) => ({
     x: new Date(p.time * 1000),
     y: Math.round((p.cpu ?? 0) * 1000) / 10,
   }));
-  const memData = rrd.map((p) => ({
+  const memData = rrd.filter((point) => Number.isFinite(point.memused) && Number.isFinite(point.memtotal) && Number(point.memtotal) > 0).map((p) => ({
     x: new Date(p.time * 1000),
     y: p.memtotal ? Math.round(((p.memused ?? 0) / p.memtotal) * 1000) / 10 : 0,
   }));
@@ -482,11 +329,11 @@ function NetworkChartContent({
     return `${v.toFixed(0)} B/s`;
   };
 
-  const netInData = rrd.map((p) => ({
+  const netInData = rrd.filter((point) => Number.isFinite(point.netin)).map((p) => ({
     x: new Date(p.time * 1000),
     y: p.netin ?? 0,
   }));
-  const netOutData = rrd.map((p) => ({
+  const netOutData = rrd.filter((point) => Number.isFinite(point.netout)).map((p) => ({
     x: new Date(p.time * 1000),
     y: p.netout ?? 0,
   }));
@@ -525,49 +372,6 @@ function NetworkChartContent({
   );
 }
 
-function GuestStatusContent({
-  vms,
-  containers,
-}: {
-  vms: PveResource[];
-  containers: PveResource[];
-}) {
-  const { t } = useTranslation();
-  const all = [...vms, ...containers];
-  const running = all.filter((r) => r.status === "running").length;
-  const stopped = all.filter((r) => r.status === "stopped").length;
-  const other = all.length - running - stopped;
-
-  const data = [
-    { title: t("common.running"), value: running },
-    { title: t("common.stopped"), value: stopped },
-    ...(other > 0 ? [{ title: t("common.other"), value: other }] : []),
-  ].filter((d) => d.value > 0);
-
-  return (
-    <PieChart
-      fitHeight
-      size="medium"
-      data={data}
-      ariaLabel={t("common.guestStatusDistribution")}
-      segmentDescription={(datum, sum) =>
-        interpolate(t("common.guestCountSummary"), {
-          count: datum.value,
-          percent: ((datum.value / sum) * 100).toFixed(0),
-        })
-      }
-      i18nStrings={{
-        filterLabel: t("common.filter"),
-        filterPlaceholder: t("common.filterData"),
-        detailPopoverDismissAriaLabel: t("common.dismiss"),
-        legendAriaLabel: t("common.legend"),
-        chartAriaRoleDescription: t("common.pieChart"),
-        segmentAriaRoleDescription: t("common.segment"),
-      }}
-      empty={<Box textAlign="center">{t("common.noGuests")}</Box>}
-    />
-  );
-}
 
 function NodeDetailsContent({ nodes }: { nodes: PveNode[] }) {
   const { t } = useTranslation();
@@ -581,7 +385,7 @@ function NodeDetailsContent({ nodes }: { nodes: PveNode[] }) {
         {
           id: "node",
           header: t("common.name"),
-          cell: (n) => <Link href={`/nodes/${n.node}`}>{n.node}</Link>,
+          cell: (n) => <Link href={`/nodes/${encodeURIComponent(n.node)}`}>{n.node}</Link>,
           isRowHeader: true,
         },
         {
@@ -596,19 +400,19 @@ function NodeDetailsContent({ nodes }: { nodes: PveNode[] }) {
         {
           id: "cpu",
           header: t("vms.cpu"),
-          cell: (n) => `${(n.cpu * 100).toFixed(1)}%`,
+          cell: (n) => n.status === "online" ? `${(n.cpu * 100).toFixed(1)}%` : "—",
         },
         {
           id: "mem",
           header: t("common.memory"),
-          cell: (n) => `${formatBytes(n.mem)} / ${formatBytes(n.maxmem)}`,
+          cell: (n) => n.status === "online" ? `${formatBytes(n.mem)} / ${formatBytes(n.maxmem)}` : "—",
         },
         {
           id: "disk",
           header: t("common.disk"),
-          cell: (n) => `${formatBytes(n.disk)} / ${formatBytes(n.maxdisk)}`,
+          cell: (n) => n.status === "online" ? `${formatBytes(n.disk)} / ${formatBytes(n.maxdisk)}` : "—",
         },
-        { id: "uptime", header: t("common.uptime"), cell: (n) => formatUptime(n.uptime) },
+        { id: "uptime", header: t("common.uptime"), cell: (n) => n.status === "online" ? formatUptime(n.uptime) : "—" },
       ]}
       empty={
         <Box textAlign="center" color="inherit">
@@ -619,7 +423,7 @@ function NodeDetailsContent({ nodes }: { nodes: PveNode[] }) {
           >
             {t("dashboard.noNodesFound")}
           </Box>
-          <Button>{t("common.addNode")}</Button>
+          <Button href="/api-explorer">{t("common.addNode")}</Button>
         </Box>
       }
     />
@@ -807,7 +611,7 @@ function StorageContent({ resources }: { resources: PveResource[] }) {
           >
             {t("common.noStorageAvailable")}
           </Box>
-          <Button>{t("common.addStorage")}</Button>
+          <Button href="/storage">{t("common.addStorage")}</Button>
         </Box>
       }
     />
@@ -823,6 +627,7 @@ interface WidgetData {
 type DashboardItem = BoardProps.Item<WidgetData>;
 
 const STORAGE_KEY = "pve-dashboard-layout";
+let volatileLayout: string | null = null;
 
 function getWidgetDescriptions(t: (key: string) => string): Record<string, string> {
   return {
@@ -914,20 +719,22 @@ function getDefaultItems(t: (key: string) => string): DashboardItem[] {
   ];
 }
 
-function loadLayout(t: (key: string) => string): DashboardItem[] {
-  if (typeof window === "undefined") return getDefaultItems(t);
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) return JSON.parse(saved);
-  } catch {}
-  return getDefaultItems(t);
+function readLayout(): string | null {
+  if (volatileLayout !== null) return volatileLayout;
+  try { return localStorage.getItem(STORAGE_KEY); } catch { return null; }
 }
-
+function subscribeLayout(callback: () => void) {
+  window.addEventListener("pve-layout-change", callback);
+  const storage = (event: StorageEvent) => { if (!event.key || event.key === STORAGE_KEY) { volatileLayout = null; callback(); } };
+  window.addEventListener("storage", storage);
+  return () => { window.removeEventListener("pve-layout-change", callback); window.removeEventListener("storage", storage); };
+}
 function saveLayout(items: DashboardItem[]) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-  } catch {}
+  const geometry = JSON.stringify(items.map(({ id, columnSpan, rowSpan }) => ({ id, columnSpan, rowSpan })));
+  try { localStorage.setItem(STORAGE_KEY, geometry); volatileLayout = null; } catch { volatileLayout = geometry; }
+  window.dispatchEvent(new Event("pve-layout-change"));
 }
+const serverLayout = () => null;
 
 function getBoardI18n(t: (key: string) => string): BoardProps.I18nStrings<WidgetData> {
   return {
@@ -958,45 +765,38 @@ export default function DashboardPage() {
   const { t } = useTranslation();
   const { data, error, loading, refresh, rrdTimeframe, setRrdTimeframe } =
     useDashboardData();
-  const [boardItems, setBoardItems] = useState<DashboardItem[]>(() => loadLayout(t));
+  const savedLayout = useSyncExternalStore(subscribeLayout, readLayout, serverLayout);
+  const boardItems = useMemo(() => {
+    const defaults = getDefaultItems(t);
+    try {
+      const saved: unknown = savedLayout ? JSON.parse(savedLayout) : null;
+      if (!Array.isArray(saved)) return defaults;
+      const seen = new Set<string>();
+      return saved.flatMap(item => {
+        const original = defaults.find(entry => entry.id === item?.id);
+        if (!original || seen.has(original.id)) return [];
+        seen.add(original.id);
+        return [{ ...original, columnSpan: Number.isInteger(item.columnSpan) && item.columnSpan >= 1 && item.columnSpan <= 4 ? item.columnSpan : original.columnSpan, rowSpan: Number.isInteger(item.rowSpan) && item.rowSpan >= (original.definition?.minRowSpan ?? 1) && item.rowSpan <= 20 ? item.rowSpan : original.rowSpan }];
+      });
+    } catch { return defaults; }
+  }, [savedLayout, t]);
   const widgetDescriptions = getWidgetDescriptions(t);
   const boardI18n = getBoardI18n(t);
   const boardItemI18n = getBoardItemI18n(t);
-
-  useEffect(() => {
-    setBoardItems((current) => current.map((item) => {
-      const defaults = getDefaultItems(t).find((defaultItem) => defaultItem.id === item.id);
-
-      if (!defaults) {
-        return item;
-      }
-
-      return {
-        ...item,
-        data: {
-          ...item.data,
-          title: defaults.data.title,
-          description: defaults.data.description,
-        },
-      };
-    }));
-  }, [t]);
 
   const handleItemsChange: BoardProps<WidgetData>["onItemsChange"] = ({
     detail: { items },
   }) => {
     const mutable = [...items];
-    setBoardItems(mutable);
     saveLayout(mutable);
   };
 
   const handleResetLayout = () => {
     const defaults = getDefaultItems(t);
-    setBoardItems(defaults);
     saveLayout(defaults);
   };
 
-  if (loading) {
+  if (loading && !data) {
     return (
       <SpaceBetween size="m">
         <Header variant="h1">{t("dashboard.dashboard")}</Header>
@@ -1007,18 +807,19 @@ export default function DashboardPage() {
     );
   }
 
-  if (error) {
+  if (error && !data) {
     return (
       <SpaceBetween size="m">
         <Header variant="h1">{t("dashboard.dashboard")}</Header>
-        <Alert type="error" header={t("common.connectionError")}>
-          {error}. Check your Proxmox connection settings in .env.local.
+        <Alert type="error" header={t("common.connectionError")} action={<Button onClick={refresh}>{t("common.refresh")}</Button>}>
+          {error}
         </Alert>
       </SpaceBetween>
     );
   }
 
-  const { nodes, resources, rrd } = data!;
+  if (!data) return null;
+  const { nodes, resources, rrd } = data;
   const vms = resources.filter((r) => r.type === "qemu" && !r.template);
   const containers = resources.filter((r) => r.type === "lxc" && !r.template);
 
@@ -1065,12 +866,14 @@ export default function DashboardPage() {
         actions={
           <SpaceBetween size="xs" direction="horizontal">
             <Button onClick={handleResetLayout}>{t("dashboard.resetLayout")}</Button>
-            <Button iconName="refresh" ariaLabel={t("common.refresh")} onClick={refresh} />
+            <Button iconName="refresh" ariaLabel={t("common.refresh")} onClick={refresh} loading={loading} />
           </SpaceBetween>
         }
       >
         {t("dashboard.dashboard")}
       </Header>
+      {Boolean(error) && <Alert type="warning" header={t("common.connectionError")}>{error}</Alert>}
+      {data.rrdUnavailable.length > 0 && <Alert type="warning">{t("common.noDataAvailable")}: {data.rrdUnavailable.join(", ")} (RRD)</Alert>}
       <Board
         items={boardItems}
         onItemsChange={handleItemsChange}

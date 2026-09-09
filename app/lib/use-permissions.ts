@@ -1,81 +1,34 @@
-"use client";
+'use client';
+import { useCallback, useEffect, useState } from 'react';
+import { useAuth } from '@/app/components/auth-context';
+import { apiFetch } from './api-client';
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useAuth } from "@/app/components/auth-context";
-
-interface PermissionEntry {
-  [path: string]: Record<string, number>;
-}
-
-interface UsePermissionsResult {
-  permissions: PermissionEntry | null;
-  loading: boolean;
-  check: (path: string, privilege: string) => boolean;
-  checkAny: (path: string, privileges: string[]) => boolean;
-}
+interface PermissionEntry { [path: string]: Record<string, number> }
+interface UsePermissionsResult { permissions: PermissionEntry | null; loading: boolean; check: (path: string, privilege: string) => boolean; checkAny: (path: string, privileges: string[]) => boolean }
 
 export function usePermissions(): UsePermissionsResult {
-  const { authenticated } = useAuth();
-  const [permissions, setPermissions] = useState<PermissionEntry | null>(null);
-  const [loading, setLoading] = useState(true);
-  const fetchedRef = useRef(false);
-
+  const { authenticated, user } = useAuth();
+  const [state, setState] = useState<{ user: string | null; data: PermissionEntry | null; loading: boolean }>({ user: null, data: null, loading: true });
   useEffect(() => {
-    if (!authenticated || fetchedRef.current) {
-      setLoading(false);
-      return;
-    }
-
-    let mounted = true;
-    fetchedRef.current = true;
-
-    const load = async () => {
+    if (!authenticated || !user) return;
+    const controller = new AbortController();
+    void (async () => {
       try {
-        const res = await fetch("/api/proxmox/access/permissions", { cache: "no-store" });
-        if (!res.ok) {
-          setLoading(false);
-          return;
-        }
-        const json = await res.json();
-        if (mounted) {
-          setPermissions(json.data ?? null);
-        }
-      } catch {
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    };
-
-    void load();
-    return () => { mounted = false; };
-  }, [authenticated]);
-
-  const check = useCallback(
-    (path: string, privilege: string): boolean => {
-      if (!permissions) return true;
-
-      const pathPerms = permissions[path];
-      if (pathPerms && pathPerms[privilege] === 1) return true;
-
-      const parts = path.split("/").filter(Boolean);
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const parentPath = "/" + parts.slice(0, i).join("/");
-        const parentPerms = permissions[parentPath];
-        if (parentPerms && parentPerms[privilege] === 1) return true;
-      }
-
-      const rootPerms = permissions["/"];
-      return rootPerms?.[privilege] === 1;
-    },
-    [permissions],
-  );
-
-  const checkAny = useCallback(
-    (path: string, privileges: string[]): boolean => {
-      return privileges.some((p) => check(path, p));
-    },
-    [check],
-  );
-
-  return { permissions, loading, check, checkAny };
+        const response = await apiFetch('/api/proxmox/access/permissions', { signal: controller.signal });
+        if (!response.ok) throw new Error('Unable to load permissions');
+        const json = await response.json();
+        if (!controller.signal.aborted) setState({ user, data: json.data || null, loading: false });
+      } catch { if (!controller.signal.aborted) setState({ user, data: null, loading: false }); }
+    })();
+    return () => controller.abort();
+  }, [authenticated, user]);
+  const permissions = authenticated && state.user === user ? state.data : null;
+  const check = useCallback((path: string, privilege: string) => {
+    if (!permissions) return false;
+    // The API returns effective per-path privileges. Never infer inheritance across explicit child ACLs.
+    const value = permissions[path]?.[privilege];
+    return value === 0 || value === 1;
+  }, [permissions]);
+  const checkAny = useCallback((path: string, privileges: string[]) => privileges.some((privilege) => check(path, privilege)), [check]);
+  return { permissions, loading: authenticated && (state.user !== user || state.loading), check, checkAny };
 }

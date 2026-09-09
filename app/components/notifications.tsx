@@ -1,17 +1,12 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import type { FlashbarProps } from "@cloudscape-design/components/flashbar";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import type { FlashbarProps } from '@cloudscape-design/components/flashbar';
+import { useAuth } from './auth-context';
+import { useTranslation } from '@/app/lib/use-translation';
+import { apiFetch } from '@/app/lib/api-client';
 
-interface TrackedTask {
-  upid: string;
-  node: string;
-  description: string;
-  startedAt: number;
-  progress?: number;
-  statusText?: string;
-}
-
+interface TrackedTask { upid: string; node: string; description: string; startedAt: number; failures: number }
 interface NotificationContextValue {
   notifications: FlashbarProps.MessageDefinition[];
   addSuccess: (message: string) => void;
@@ -19,188 +14,89 @@ interface NotificationContextValue {
   addInfo: (message: string) => void;
   trackTask: (upid: string, node: string, description: string) => void;
 }
+const NotificationContext = createContext<NotificationContextValue>({ notifications: [], addSuccess: () => {}, addError: () => {}, addInfo: () => {}, trackTask: () => {} });
+export function useNotifications() { return useContext(NotificationContext); }
 
-const NotificationContext = createContext<NotificationContextValue>({
-  notifications: [],
-  addSuccess: () => {},
-  addError: () => {},
-  addInfo: () => {},
-  trackTask: () => {},
-});
-
-export function useNotifications() {
-  return useContext(NotificationContext);
+export function retainNotifications(items: FlashbarProps.MessageDefinition[]) {
+  let history = 0;
+  return items.filter(item => {
+    if (item.loading || item.type === 'in-progress' || item.type === 'error' || item.type === 'warning') return true;
+    return history++ < 100;
+  });
 }
 
-let notificationId = 0;
-
 export function NotificationProvider({ children }: { children: ReactNode }) {
+  const { authenticated, user } = useAuth();
+  const { language } = useTranslation();
   const [notifications, setNotifications] = useState<FlashbarProps.MessageDefinition[]>([]);
-  const [trackedTasks, setTrackedTasks] = useState<TrackedTask[]>([]);
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const dismiss = useCallback((id: string) => {
-    setNotifications((prev) => prev.filter((n) => n.id !== id));
+  const tasks = useRef(new Map<string, TrackedTask>());
+  const completed = useRef(new Set<string>());
+  const sequence = useRef(0);
+  const dismiss = useCallback((id: string) => setNotifications(current => current.filter(item => item.id !== id)), []);
+  const notify = useCallback((type: FlashbarProps.Type, content: string) => {
+    const id = `notification-${++sequence.current}`;
+    setNotifications(current => retainNotifications([{ id, type, content, dismissible: true, onDismiss: () => dismiss(id) }, ...current]));
+  }, [dismiss]);
+  const addSuccess = useCallback((message: string) => notify('success', message), [notify]);
+  const addError = useCallback((message: string) => notify('error', message), [notify]);
+  const addInfo = useCallback((message: string) => notify('info', message), [notify]);
+  const trackTask = useCallback((upid: string, node: string, description: string) => {
+    if (!upid.startsWith('UPID:') || !node || tasks.current.has(upid) || completed.current.has(upid)) return;
+    tasks.current.set(upid, { upid, node, description, startedAt: Date.now(), failures: 0 });
+    const id = `task-${upid}`;
+    setNotifications(current => [{ id, type: 'in-progress', content: description, loading: true, dismissible: false }, ...current]);
   }, []);
-
-  const addNotification = useCallback(
-    (type: FlashbarProps.Type, message: string, autoDismiss = true) => {
-      const id = `notif-${++notificationId}`;
-      setNotifications((prev) => [
-        {
-          id,
-          type,
-          content: message,
-          dismissible: true,
-          onDismiss: () => dismiss(id),
-        },
-        ...prev,
-      ]);
-
-      if (autoDismiss) {
-        setTimeout(() => dismiss(id), type === "error" ? 10000 : 5000);
-      }
-    },
-    [dismiss],
-  );
-
-  const addSuccess = useCallback((message: string) => addNotification("success", message), [addNotification]);
-  const addError = useCallback((message: string) => addNotification("error", message), [addNotification]);
-  const addInfo = useCallback((message: string) => addNotification("info", message), [addNotification]);
-
-  const trackTask = useCallback(
-    (upid: string, node: string, description: string) => {
-      setTrackedTasks((prev) => [...prev, { upid, node, description, startedAt: Date.now(), progress: 0 }]);
-
-      const id = `task-${++notificationId}`;
-      setNotifications((prev) => [
-        {
-          id,
-          type: "in-progress" as FlashbarProps.Type,
-          content: `${description} (0%)`,
-          dismissible: false,
-          loading: true,
-        },
-        ...prev,
-      ]);
-    },
-    [],
-  );
-
-  const pollTasks = useCallback(async () => {
-    if (trackedTasks.length === 0) return;
-
-    const completed: TrackedTask[] = [];
-
-    await Promise.all(
-      trackedTasks.map(async (task) => {
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (authenticated && detail && typeof detail.upid === 'string' && typeof detail.node === 'string' && typeof detail.description === 'string') trackTask(detail.upid, detail.node, detail.description);
+    };
+    window.addEventListener('proxmox-task-started', listener);
+    return () => window.removeEventListener('proxmox-task-started', listener);
+  }, [authenticated, trackTask]);
+  useEffect(() => {
+    const activeTasks = tasks.current;
+    const finishedTasks = completed.current;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      // A single in-flight batch prevents slow responses from polling a task twice.
+      const pending = [...activeTasks.values()];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(6, pending.length) }, async () => {
+      while (next < pending.length && !controller.signal.aborted) {
+        const task = pending[next++];
+        const id = `task-${task.upid}`;
         try {
-          const res = await fetch(
-            `/api/proxmox/nodes/${task.node}/tasks/${encodeURIComponent(task.upid)}/status`,
-            { cache: "no-store" },
-          );
-          if (!res.ok) return;
-          const json = await res.json();
-          const status = json.data?.status;
-          const exitstatus = json.data?.exitstatus;
-
-          if (status && status !== "running") {
-            completed.push(task);
-            const ok = exitstatus === "OK" || (typeof exitstatus === "string" && exitstatus.startsWith("OK"));
-            const displayContent = ok ? task.description : `${task.description}: ${exitstatus ?? status}`;
-
-            setNotifications((prev) =>
-              prev
-                .filter((n) => !n.loading || !n.content?.toString().startsWith(task.description))
-                .concat([
-                  {
-                    id: `task-done-${++notificationId}`,
-                    type: ok ? "success" : "error",
-                    content: displayContent,
-                    dismissible: true,
-                    onDismiss: () => dismiss(`task-done-${notificationId}`),
-                  },
-                ]),
-            );
-            setTimeout(() => {
-              setNotifications((prev) =>
-                prev.filter((n) => n.content !== displayContent),
-              );
-            }, ok ? 5000 : 10000);
+          const response = await apiFetch(`/api/proxmox/nodes/${encodeURIComponent(task.node)}/tasks/${encodeURIComponent(task.upid)}/status`, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]), maxRetries: 0 });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const { data } = await response.json();
+          if (!data || !['running', 'stopped'].includes(data.status)) throw new Error('Invalid task status');
+          if (controller.signal.aborted) return;
+          if (data.status === 'stopped' && (typeof data.exitstatus !== 'string' || !data.exitstatus)) throw new Error('Task exit status is not yet available');
+          task.failures = 0;
+          if (data.status === 'stopped') {
+            activeTasks.delete(task.upid);
+            finishedTasks.add(task.upid);
+            if (finishedTasks.size > 1000) finishedTasks.delete(finishedTasks.values().next().value!);
+            const ok = data.exitstatus === 'OK';
+            setNotifications(current => current.map(item => item.id === id ? { id, type: ok ? 'success' : 'error', content: `${task.description}: ${data.exitstatus ?? (language === 'ko' ? '완료 상태 알 수 없음' : 'Unknown exit status')}`, loading: false, dismissible: true, onDismiss: () => dismiss(id) } : item));
+            window.dispatchEvent(new CustomEvent('proxmox-task-finished', { detail: { upid: task.upid, node: task.node, ok } }));
           } else {
-            const logRes = await fetch(
-              `/api/proxmox/nodes/${task.node}/tasks/${encodeURIComponent(task.upid)}/log?limit=5&start=0`,
-              { cache: "no-store" },
-            );
-            let progressPct = 0;
-            let statusLine = "";
-            if (logRes.ok) {
-              const logJson = await logRes.json();
-              const lines: { n: number; t: string }[] = logJson.data ?? [];
-              const total = logJson.total ?? 0;
-              if (total > 0 && lines.length > 0) {
-                const lastLine = lines[lines.length - 1]?.t ?? "";
-                const pctMatch = lastLine.match(/(\d+(?:\.\d+)?)%/);
-                if (pctMatch) {
-                  progressPct = Math.min(99, Math.round(parseFloat(pctMatch[1])));
-                }
-                statusLine = lastLine;
-              }
-            }
-
-            const elapsed = Math.round((Date.now() - task.startedAt) / 1000);
-            const progressText = progressPct > 0
-              ? `${task.description} (${progressPct}% - ${elapsed}s)`
-              : `${task.description} (${elapsed}s)`;
-
-            setTrackedTasks((prev) =>
-              prev.map((t) =>
-                t.upid === task.upid ? { ...t, progress: progressPct, statusText: statusLine } : t,
-              ),
-            );
-
-            setNotifications((prev) =>
-              prev.map((n) =>
-                n.loading && n.content?.toString().startsWith(task.description)
-                  ? { ...n, content: progressText }
-                  : n,
-              ),
-            );
+            const seconds = Math.round((Date.now() - task.startedAt) / 1000);
+            setNotifications(current => current.map(item => item.id === id ? { ...item, type: 'in-progress', content: `${task.description} (${seconds}s)`, loading: true } : item));
           }
         } catch {
-          completed.push(task);
+          if (controller.signal.aborted) return;
+          task.failures += 1;
+          if (task.failures >= 3) setNotifications(current => current.map(item => item.id === id ? { ...item, type: 'warning', loading: false, content: `${task.description}: ${language === 'ko' ? '완료 상태를 확인할 수 없습니다. 연결을 다시 확인하는 중입니다.' : 'Completion status unavailable. Retrying the connection.'}` } : item));
         }
-      }),
-    );
-
-    if (completed.length > 0) {
-      setTrackedTasks((prev) => prev.filter((t) => !completed.some((c) => c.upid === t.upid)));
+      }
+      }));
+      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 2000);
     }
-  }, [trackedTasks, dismiss]);
-
-  useEffect(() => {
-    if (trackedTasks.length > 0) {
-      if (!pollingRef.current) {
-        pollingRef.current = setInterval(() => void pollTasks(), 2000);
-      }
-    } else {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-    }
-
-    return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-    };
-  }, [trackedTasks.length, pollTasks]);
-
-  return (
-    <NotificationContext.Provider value={{ notifications, addSuccess, addError, addInfo, trackTask }}>
-      {children}
-    </NotificationContext.Provider>
-  );
+    if (authenticated) timer = setTimeout(() => void poll(), 2000);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [authenticated, user, language, dismiss]);
+  return <NotificationContext.Provider value={{ notifications: authenticated ? notifications : [], addSuccess, addError, addInfo, trackTask }}>{children}</NotificationContext.Provider>;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -14,12 +14,15 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import ConsoleViewer from "@/app/components/console-viewer";
 import type { ConsoleMode, ConsoleSession } from "@/app/lib/console-session";
 import { useTranslation } from "@/app/lib/use-translation";
+import { apiFetch } from "@/app/lib/api-client";
 import { buildWsRelayUrl } from "@/app/lib/ws-relay-url";
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected" | "error";
 
 export default function NodeShellPage() {
   const { t } = useTranslation();
+  const translation = useRef(t);
+  useEffect(() => { translation.current = t; }, [t]);
   const params = useParams<{ node: string }>();
   const router = useRouter();
   const [status, setStatus] = useState<ConnectionStatus>("idle");
@@ -44,20 +47,25 @@ export default function NodeShellPage() {
     if (!node) return;
 
     let cancelled = false;
+    const controller = new AbortController();
+    // A new external console connection must replace the previous session and status.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setStatus("connecting");
     setSession(null);
 
     const connect = async () => {
       try {
-        const consoleRes = await fetch("/api/console/node", {
+        const consoleRes = await apiFetch("/api/console/node", {
           method: "POST",
+          signal: controller.signal,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ node, mode }),
         });
         const consoleData = await consoleRes.json();
+        if (cancelled) return;
         if (!consoleRes.ok || consoleData.error) {
-          throw new Error(consoleData.error ?? t("console.failedToConnect"));
+          throw new Error(consoleData.error ?? translation.current("console.failedToConnect"));
         }
 
         if (cancelled) return;
@@ -79,14 +87,14 @@ export default function NodeShellPage() {
         });
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : t("console.failedToConnect"));
+        setError(err instanceof Error ? err.message : translation.current("console.failedToConnect"));
         setStatus("error");
       }
     };
 
     void connect();
-    return () => { cancelled = true; };
-  }, [node, mode, attempt, t]);
+    return () => { cancelled = true; controller.abort(); };
+  }, [node, mode, attempt]);
 
   const statusType = status === "connected"
     ? ("success" as const)
@@ -106,7 +114,7 @@ export default function NodeShellPage() {
 
   return (
     <SpaceBetween size="m">
-      {error && <Alert type="error" header={t("console.consoleError")}>{error}</Alert>}
+      {Boolean(error) && <Alert type="error" header={t("console.consoleError")}>{error}</Alert>}
       <Header
         variant="h1"
         actions={

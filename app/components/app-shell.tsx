@@ -2,6 +2,8 @@
 
 import { type ReactNode, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import Alert from "@cloudscape-design/components/alert";
+import Button from "@cloudscape-design/components/button";
 import Box from "@cloudscape-design/components/box";
 import Spinner from "@cloudscape-design/components/spinner";
 import TopNavigation from "@cloudscape-design/components/top-navigation";
@@ -11,9 +13,10 @@ import BreadcrumbGroup, { type BreadcrumbGroupProps } from "@cloudscape-design/c
 import Flashbar from "@cloudscape-design/components/flashbar";
 import { I18nProvider } from "@cloudscape-design/components/i18n";
 import enMessages from "@cloudscape-design/components/i18n/messages/all.en.json";
+import koMessages from "@cloudscape-design/components/i18n/messages/all.ko.json";
 import { AuthProvider, useAuth } from "./auth-context";
 import { NotificationProvider, useNotifications } from "./notifications";
-import { SettingsProvider } from "./settings-context";
+import { SettingsProvider, useSettings } from "./settings-context";
 import { useTranslation } from "@/app/lib/use-translation";
 
 import "@cloudscape-design/global-styles/dark-mode-utils.css";
@@ -37,6 +40,7 @@ function useBreadcrumbs(t: (key: string) => string) {
     "/pools": t("nav.pools"),
     "/logs": t("nav.logs"),
     "/settings": t("nav.settings"),
+    "/api-explorer": "API",
   };
   const items = [{ text: "Proxmox VE", href: "/" }];
 
@@ -47,7 +51,7 @@ function useBreadcrumbs(t: (key: string) => string) {
       href += `/${segment}`;
       items.push({
         text: breadcrumbMap[href] ?? segment,
-        href,
+        href: href === "/cluster" ? "/cluster/options" : href,
       });
     }
   }
@@ -59,26 +63,30 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
   return (
-    <I18nProvider locale="en" messages={[enMessages]}>
-      <AuthProvider>
-        <SettingsProvider>
-          <NotificationProvider>
-            {pathname === "/login" ? children : <AppShellInner>{children}</AppShellInner>}
-          </NotificationProvider>
-        </SettingsProvider>
-      </AuthProvider>
-    </I18nProvider>
+    <AuthProvider>
+      <SettingsProvider>
+        <LocalizedShell>{pathname === "/login" ? children : <AppShellInner>{children}</AppShellInner>}</LocalizedShell>
+      </SettingsProvider>
+    </AuthProvider>
   );
+}
+
+function LocalizedShell({ children }: { children: ReactNode }) {
+  const { language } = useSettings();
+  const { user } = useAuth();
+  return <I18nProvider locale={language} messages={[enMessages, koMessages]}>
+    <NotificationProvider key={user ?? "anonymous"}>{children}</NotificationProvider>
+  </I18nProvider>;
 }
 
 function AppShellInner({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { t } = useTranslation();
+  const { t, language } = useTranslation();
   const breadcrumbs = useBreadcrumbs(t);
   const [navOpen, setNavOpen] = useState(true);
   const { notifications } = useNotifications();
-  const { authenticated, loading, logout, user } = useAuth();
+  const { authenticated, loading, logout, logoutError, sessionError, reloadSession, user } = useAuth();
 
   const navHeader: SideNavigationProps["header"] = {
     text: "Proxmox VE",
@@ -128,6 +136,7 @@ function AppShellInner({ children }: { children: ReactNode }) {
         { type: "link", text: t("nav.permissions"), href: "/permissions" },
         { type: "link", text: t("nav.pools"), href: "/pools" },
         { type: "link", text: t("nav.logs"), href: "/logs" },
+        { type: "link", text: language === "ko" ? "전체 API 관리" : "API management", href: "/api-explorer" },
         { type: "link", text: t("nav.settings"), href: "/settings" },
       ],
     },
@@ -161,7 +170,7 @@ function AppShellInner({ children }: { children: ReactNode }) {
   }
 
   if (!authenticated) {
-    return null;
+    return sessionError ? <Box padding="xxl"><Alert type="error" action={<Button onClick={reloadSession}>{language === "ko" ? "다시 시도" : "Retry"}</Button>}>{sessionError}</Alert></Box> : null;
   }
 
   return (
@@ -194,9 +203,7 @@ function AppShellInner({ children }: { children: ReactNode }) {
               : [{ id: "empty", text: t("nav.noNotifications"), disabled: true }],
             onItemClick: ({ detail }) => {
               const notif = notifications.find((n) => n.id === detail.id);
-              if (notif?.dismissible && notif.onDismiss) {
-                notif.onDismiss(new CustomEvent("dismiss"));
-              }
+              if (notif?.id?.startsWith("task-")) router.push("/logs");
             },
           },
           {
@@ -234,7 +241,7 @@ function AppShellInner({ children }: { children: ReactNode }) {
         breadcrumbs={<BreadcrumbGroup items={breadcrumbs} onFollow={onBreadcrumbFollow} />}
         notifications={<Flashbar items={notifications} />}
         toolsHide
-        content={children}
+        content={<>{logoutError && <Alert type="error">{logoutError}</Alert>}{children}</>}
       />
     </>
   );

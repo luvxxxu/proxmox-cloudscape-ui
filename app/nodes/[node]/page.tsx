@@ -1,7 +1,11 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
+import { formatResourceBytes as formatBytes, setOptionalParameters } from "@/app/lib/resource-api";
+
 import { useCollection } from "@cloudscape-design/collection-hooks";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
 import AreaChart from "@cloudscape-design/components/area-chart";
@@ -194,7 +198,7 @@ interface PveNodeFirewallOptions {
   log_level_in?: string;
   log_level_out?: string;
   ndp?: number;
-  log_smurfs?: number;
+  smurf_log_level?: string;
   tcp_flags_log_level?: string;
 }
 
@@ -239,13 +243,7 @@ interface NodeDetailData {
   rrd: PveRrdPoint[];
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
+
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
@@ -319,28 +317,21 @@ function isTruthyDiskFlag(value?: number | string | boolean) {
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T | string } | null;
-
-  if (!response.ok) {
-    throw new Error(typeof json?.data === "string" ? json.data : `Request failed with status ${response.status}`);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path, init);
 }
 
 export default function NodeDetailPage() {
   const params = useParams<{ node: string }>();
   const node = Array.isArray(params.node) ? params.node[0] : params.node;
+  return <NodeDetails key={node} node={node} />;
+}
+
+function NodeDetails({ node }: { node: string }) {
   const [activeTabId, setActiveTabId] = useState("summary");
   const [data, setData] = useState<NodeDetailData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const { t } = useTranslation();
+  const { t, language } = useTranslation();
   const [actionLoading, setActionLoading] = useState<"reboot" | "shutdown" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [flashbarItems, setFlashbarItems] = useState<FlashbarProps.MessageDefinition[]>([]);
@@ -400,6 +391,7 @@ export default function NodeDetailPage() {
   const [initGptModalVisible, setInitGptModalVisible] = useState(false);
   const [wipeDiskModalVisible, setWipeDiskModalVisible] = useState(false);
   const [diskActionLoading, setDiskActionLoading] = useState(false);
+  const [diskConfirmation, setDiskConfirmation] = useState("");
   const [subscriptionData, setSubscriptionData] = useState<PveNodeSubscription | null>(null);
   const [subscriptionLoading, setSubscriptionLoading] = useState(false);
   const [subscriptionError, setSubscriptionError] = useState<string | null>(null);
@@ -410,11 +402,14 @@ export default function NodeDetailPage() {
   const [firewallRules, setFirewallRules] = useState<PveNodeFirewallRule[]>([]);
   const [firewallOptions, setFirewallOptions] = useState<PveNodeFirewallOptions | null>(null);
   const [firewallLog, setFirewallLog] = useState<PveNodeFirewallLogEntry[]>([]);
+  const [fwOptionsLoading, setFwOptionsLoading] = useState(false);
   const [fwRulesLoading, setFwRulesLoading] = useState(false);
   const [fwRulesLoaded, setFwRulesLoaded] = useState(false);
   const [fwLogLoading, setFwLogLoading] = useState(false);
   const [fwLogLoaded, setFwLogLoaded] = useState(false);
   const [fwError, setFwError] = useState<string | null>(null);
+  const [fwLoadErrors, setFwLoadErrors] = useState<{ rules?: string; options?: string; log?: string }>({});
+  const fwLoadError = Object.values(fwLoadErrors).filter(Boolean).join(" · ");
   const [fwRuleModalVisible, setFwRuleModalVisible] = useState(false);
   const [fwRuleEditPos, setFwRuleEditPos] = useState<number | null>(null);
   const [fwRuleForm, setFwRuleForm] = useState({
@@ -440,7 +435,7 @@ export default function NodeDetailPage() {
     log_level_in: "",
     log_level_out: "",
     ndp: "0",
-    log_smurfs: "0",
+    smurf_log_level: "nolog",
     tcp_flags_log_level: "",
   });
   const [pciDevices, setPciDevices] = useState<PveNodePciDevice[]>([]);
@@ -449,23 +444,30 @@ export default function NodeDetailPage() {
   const [pciLoaded, setPciLoaded] = useState(false);
   const [usbLoading, setUsbLoading] = useState(false);
   const [usbLoaded, setUsbLoaded] = useState(false);
-  const [hwError, setHwError] = useState<string | null>(null);
+  const [hwErrors, setHwErrors] = useState<{ pci?: string; usb?: string }>({});
+  const hwError = Object.values(hwErrors).filter(Boolean).join(" · ");
+
+  const detailRequest = useRef<AbortController | null>(null);
 
   const loadNode = useCallback(async () => {
     if (!node) {
       return;
     }
 
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
     try {
       setLoading(true);
       setActionError(null);
       const [status, network, storage, tasks, rrd] = await Promise.all([
-        fetchProxmox<PveNodeStatus>(`/api/proxmox/nodes/${node}/status`),
-        fetchProxmox<PveNetwork[]>(`/api/proxmox/nodes/${node}/network`),
-        fetchProxmox<PveStorage[]>(`/api/proxmox/nodes/${node}/storage`),
-        fetchProxmox<PveTask[]>(`/api/proxmox/nodes/${node}/tasks?limit=50`),
-        fetchProxmox<PveRrdPoint[]>(`/api/proxmox/nodes/${node}/rrddata?timeframe=hour&cf=AVERAGE`),
+        fetchProxmox<PveNodeStatus>(`/api/proxmox/nodes/${node}/status`, { signal: controller.signal }),
+        fetchProxmox<PveNetwork[]>(`/api/proxmox/nodes/${node}/network`, { signal: controller.signal }),
+        fetchProxmox<PveStorage[]>(`/api/proxmox/nodes/${node}/storage`, { signal: controller.signal }),
+        fetchProxmox<PveTask[]>(`/api/proxmox/nodes/${node}/tasks?limit=50`, { signal: controller.signal }),
+        fetchProxmox<PveRrdPoint[]>(`/api/proxmox/nodes/${node}/rrddata?timeframe=hour&cf=AVERAGE`, { signal: controller.signal }),
       ]);
+      if (controller.signal.aborted) return;
       setData({
         status,
         network: network ?? [],
@@ -475,14 +477,19 @@ export default function NodeDetailPage() {
       });
       setError(null);
     } catch (fetchError) {
+      if (controller.signal.aborted) return;
       setError(fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoad"));
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, [node, t]);
 
+  useResourceTaskRefresh(loadNode);
+
   useEffect(() => {
+    // Start an external request; loading state belongs to its asynchronous lifecycle.
     void loadNode();
+    return () => detailRequest.current?.abort();
   }, [loadNode]);
 
   const loadDns = useCallback(async () => {
@@ -653,9 +660,9 @@ export default function NodeDetailPage() {
       const rules = await fetchProxmox<PveNodeFirewallRule[]>(`/api/proxmox/nodes/${node}/firewall/rules`);
       setFirewallRules(rules ?? []);
       setFwRulesLoaded(true);
-      setFwError(null);
+      setFwLoadErrors((current) => ({ ...current, rules: undefined }));
     } catch (fetchError) {
-      setFwError(fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadFirewallRules"));
+      setFwLoadErrors((current) => ({ ...current, rules: fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadFirewallRules") }));
     } finally {
       setFwRulesLoading(false);
     }
@@ -667,11 +674,14 @@ export default function NodeDetailPage() {
     }
 
     try {
+      setFwOptionsLoading(true);
       const options = await fetchProxmox<PveNodeFirewallOptions>(`/api/proxmox/nodes/${node}/firewall/options`);
-      setFirewallOptions(options ?? null);
-      setFwError(null);
+      setFirewallOptions(options ?? {});
+      setFwLoadErrors((current) => ({ ...current, options: undefined }));
     } catch (fetchError) {
-      setFwError(fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadFirewallOptions"));
+      setFwLoadErrors((current) => ({ ...current, options: fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadFirewallOptions") }));
+    } finally {
+      setFwOptionsLoading(false);
     }
   }, [node, t]);
 
@@ -685,9 +695,9 @@ export default function NodeDetailPage() {
       const logEntries = await fetchProxmox<PveNodeFirewallLogEntry[]>(`/api/proxmox/nodes/${node}/firewall/log?limit=50`);
       setFirewallLog(logEntries ?? []);
       setFwLogLoaded(true);
-      setFwError(null);
+      setFwLoadErrors((current) => ({ ...current, log: undefined }));
     } catch (fetchError) {
-      setFwError(fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadFirewallLog"));
+      setFwLoadErrors((current) => ({ ...current, log: fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadFirewallLog") }));
     } finally {
       setFwLogLoading(false);
     }
@@ -703,9 +713,9 @@ export default function NodeDetailPage() {
       const devices = await fetchProxmox<PveNodePciDevice[]>(`/api/proxmox/nodes/${node}/hardware/pci`);
       setPciDevices(devices ?? []);
       setPciLoaded(true);
-      setHwError(null);
+      setHwErrors((current) => ({ ...current, pci: undefined }));
     } catch (fetchError) {
-      setHwError(fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadPci"));
+      setHwErrors((current) => ({ ...current, pci: fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadPci") }));
     } finally {
       setPciLoading(false);
     }
@@ -721,9 +731,9 @@ export default function NodeDetailPage() {
       const devices = await fetchProxmox<PveNodeUsbDevice[]>(`/api/proxmox/nodes/${node}/hardware/usb`);
       setUsbDevices(devices ?? []);
       setUsbLoaded(true);
-      setHwError(null);
+      setHwErrors((current) => ({ ...current, usb: undefined }));
     } catch (fetchError) {
-      setHwError(fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadUsb"));
+      setHwErrors((current) => ({ ...current, usb: fetchError instanceof Error ? fetchError.message : t("nodeDetail.failedToLoadUsb") }));
     } finally {
       setUsbLoading(false);
     }
@@ -731,6 +741,7 @@ export default function NodeDetailPage() {
 
   useEffect(() => {
     if (activeTabId === "dns" && !dnsConfig && !dnsLoading && !dnsError) {
+      // Start external tab requests; each loader owns its loading, data, and error lifecycle.
       void loadDns();
     }
     if (activeTabId === "time" && !timeConfig && !timeLoading && !timeError) {
@@ -758,21 +769,21 @@ export default function NodeDetailPage() {
       void loadSubscription();
     }
     if (activeTabId === "firewall") {
-      if (!fwRulesLoaded && !fwRulesLoading && !fwError) {
+      if (!fwRulesLoaded && !fwRulesLoading && !fwLoadErrors.rules) {
         void loadFirewallRules();
       }
-      if (!firewallOptions && !fwError) {
+      if (!firewallOptions && !fwOptionsLoading && !fwLoadErrors.options) {
         void loadFirewallOptions();
       }
-      if (!fwLogLoaded && !fwLogLoading && !fwError) {
+      if (!fwLogLoaded && !fwLogLoading && !fwLoadErrors.log) {
         void loadFirewallLog();
       }
     }
     if (activeTabId === "hardware") {
-      if (!pciLoaded && !pciLoading && !hwError) {
+      if (!pciLoaded && !pciLoading && !hwErrors.pci) {
         void loadPciDevices();
       }
-      if (!usbLoaded && !usbLoading && !hwError) {
+      if (!usbLoaded && !usbLoading && !hwErrors.usb) {
         void loadUsbDevices();
       }
     }
@@ -788,7 +799,8 @@ export default function NodeDetailPage() {
     disksError,
     disksLoading,
     firewallOptions,
-    fwError,
+    fwOptionsLoading,
+    fwLoadErrors,
     fwLogLoaded,
     fwLogLoading,
     fwRulesLoaded,
@@ -829,7 +841,7 @@ export default function NodeDetailPage() {
     timeLoading,
     usbLoaded,
     usbLoading,
-    hwError,
+    hwErrors,
   ]);
 
   const openDnsModal = useCallback(() => {
@@ -882,12 +894,12 @@ export default function NodeDetailPage() {
 
   const openFirewallOptionsModal = useCallback(() => {
     setFwOptionsForm({
-      enable: String(firewallOptions?.enable ?? 0),
-      log_level_in: firewallOptions?.log_level_in ?? "",
-      log_level_out: firewallOptions?.log_level_out ?? "",
-      ndp: String(firewallOptions?.ndp ?? 0),
-      log_smurfs: String(firewallOptions?.log_smurfs ?? 0),
-      tcp_flags_log_level: firewallOptions?.tcp_flags_log_level ?? "",
+      enable: String(firewallOptions?.enable ?? 1),
+      log_level_in: firewallOptions?.log_level_in ?? "nolog",
+      log_level_out: firewallOptions?.log_level_out ?? "nolog",
+      ndp: String(firewallOptions?.ndp ?? 1),
+      smurf_log_level: String(firewallOptions?.smurf_log_level ?? "nolog"),
+      tcp_flags_log_level: firewallOptions?.tcp_flags_log_level ?? "nolog",
     });
     setFwError(null);
     setFwOptionsModalVisible(true);
@@ -1248,7 +1260,7 @@ export default function NodeDetailPage() {
       const body = new URLSearchParams({ key });
 
       await fetchProxmox(`/api/proxmox/nodes/${node}/subscription`, {
-        method: "POST",
+        method: "PUT",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
         },
@@ -1314,17 +1326,12 @@ export default function NodeDetailPage() {
       setFwError(null);
 
       const body = new URLSearchParams({
-        type: fwRuleForm.type.trim(),
-        action: fwRuleForm.action.trim(),
-        macro: fwRuleForm.macro.trim(),
-        proto: fwRuleForm.proto.trim(),
-        source: fwRuleForm.source.trim(),
-        dest: fwRuleForm.dest.trim(),
-        dport: fwRuleForm.dport.trim(),
-        sport: fwRuleForm.sport.trim(),
-        comment: fwRuleForm.comment.trim(),
-        enable: String(fwRuleForm.enable),
+        type: fwRuleForm.type.trim(), action: fwRuleForm.action.trim(), enable: String(fwRuleForm.enable),
       });
+      setOptionalParameters(body, {
+        macro: fwRuleForm.macro, proto: fwRuleForm.proto, source: fwRuleForm.source,
+        dest: fwRuleForm.dest, dport: fwRuleForm.dport, sport: fwRuleForm.sport, comment: fwRuleForm.comment,
+      }, fwRuleEditPos !== null);
 
       await fetchProxmox(
         fwRuleEditPos == null
@@ -1369,7 +1376,7 @@ export default function NodeDetailPage() {
         log_level_in: fwOptionsForm.log_level_in.trim(),
         log_level_out: fwOptionsForm.log_level_out.trim(),
         ndp: fwOptionsForm.ndp.trim(),
-        log_smurfs: fwOptionsForm.log_smurfs.trim(),
+        smurf_log_level: fwOptionsForm.smurf_log_level.trim(),
         tcp_flags_log_level: fwOptionsForm.tcp_flags_log_level.trim(),
       });
 
@@ -1453,7 +1460,7 @@ export default function NodeDetailPage() {
   }, [node, t]);
 
   const runDiskAction = useCallback(async (action: "initgpt" | "wipedisk") => {
-    if (!node || !selectedDisk) {
+    if (!node || !selectedDisk || diskActionLoading || diskConfirmation !== selectedDisk.devpath) {
       return;
     }
 
@@ -1473,7 +1480,7 @@ export default function NodeDetailPage() {
 
       pushFlash({
         type: "success",
-        content: t(action === "initgpt" ? "nodeDetail.initGptSuccess" : "nodeDetail.wipeDiskSuccess"),
+        content: t(action === "initgpt" ? "nodeDetail.initGptSuccess" : "nodeDetail.wipeDiskSuccess").replace("{device}", selectedDisk.devpath),
         dismissible: true,
         id: `disk-${action}-${selectedDisk.devpath}`,
       });
@@ -1490,7 +1497,7 @@ export default function NodeDetailPage() {
     } finally {
       setDiskActionLoading(false);
     }
-  }, [loadDisks, node, pushFlash, selectedDisk, t]);
+  }, [diskActionLoading, diskConfirmation, loadDisks, node, pushFlash, selectedDisk, t]);
 
   const networkColumns = useMemo<TableProps<PveNetwork>["columnDefinitions"]>(
     () => [
@@ -1810,10 +1817,14 @@ export default function NodeDetailPage() {
             <Button variant="inline-link" onClick={() => void openSmartModal(disk)}>{t("nodeDetail.viewSmart")}</Button>
             <Button variant="inline-link" onClick={() => {
               setSelectedDisk(disk);
+              setDiskConfirmation("");
+              setDisksError(null);
               setInitGptModalVisible(true);
             }}>{t("nodeDetail.initGpt")}</Button>
             <Button variant="inline-link" onClick={() => {
               setSelectedDisk(disk);
+              setDiskConfirmation("");
+              setDisksError(null);
               setWipeDiskModalVisible(true);
             }}>{t("nodeDetail.wipeDisk")}</Button>
           </SpaceBetween>
@@ -2308,7 +2319,7 @@ export default function NodeDetailPage() {
     },
     {
       label: t("nodeDetail.firewallLogSmurfs"),
-      value: firewallOptions?.log_smurfs ? t("common.yes") : t("common.no"),
+      value: firewallOptions?.smurf_log_level ?? "nolog",
     },
   ];
 
@@ -2646,8 +2657,8 @@ export default function NodeDetailPage() {
       label: t("nodeDetail.nodeFirewall"),
       content: (
         <SpaceBetween size="l">
-          {fwError ? (
-            <Alert type="error" header={t("nodeDetail.nodeFirewall")}>{fwError}</Alert>
+          {fwError || fwLoadError ? (
+            <Alert type="error" header={t("nodeDetail.nodeFirewall")}>{fwError || fwLoadError}</Alert>
           ) : null}
           <Table<PveNodeFirewallRule>
             variant="borderless"
@@ -2794,7 +2805,7 @@ export default function NodeDetailPage() {
 
   return (
     <SpaceBetween size="m">
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, dismissLabel: item.dismissLabel ?? t("common.close"), onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry !== item))) }))} /> : null}
       {actionError ? (
         <Alert type="error" header={t("common.error")} dismissible onDismiss={() => setActionError(null)}>
           {actionError}
@@ -2869,8 +2880,8 @@ export default function NodeDetailPage() {
         activeTabId={activeTabId}
         onChange={({ detail }) => setActiveTabId(detail.activeTabId)}
       />
-      <Modal
-        visible={rebootModalVisible}
+      {rebootModalVisible && <Modal
+        visible
         onDismiss={() => setRebootModalVisible(false)}
         header={t("nodeDetail.rebootNode")}
         closeAriaLabel={t("nodeDetail.rebootNode")}
@@ -2886,9 +2897,9 @@ export default function NodeDetailPage() {
         }
       >
         <Box>{t("nodeDetail.confirmReboot").replace("{node}", node)}</Box>
-      </Modal>
-      <Modal
-        visible={shutdownModalVisible}
+      </Modal>}
+      {shutdownModalVisible && <Modal
+        visible
         onDismiss={() => setShutdownModalVisible(false)}
         header={t("nodeDetail.shutdownNode")}
         closeAriaLabel={t("nodeDetail.shutdownNode")}
@@ -2904,9 +2915,9 @@ export default function NodeDetailPage() {
         }
       >
         <Box>{t("nodeDetail.confirmShutdown").replace("{node}", node)}</Box>
-      </Modal>
-      <Modal
-        visible={dnsModalVisible}
+      </Modal>}
+      {dnsModalVisible && <Modal
+        visible
         onDismiss={() => {
           setDnsModalVisible(false);
           setDnsError(null);
@@ -2963,9 +2974,9 @@ export default function NodeDetailPage() {
             />
           </FormField>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={timeModalVisible}
+      </Modal>}
+      {timeModalVisible && <Modal
+        visible
         onDismiss={() => {
           setTimeModalVisible(false);
           setTimeError(null);
@@ -2997,9 +3008,9 @@ export default function NodeDetailPage() {
             <Input value={timezoneValue} placeholder={t("nodeDetail.timezonePlaceholder")} onChange={({ detail }) => setTimezoneValue(detail.value)} />
           </FormField>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={hostsModalVisible}
+      </Modal>}
+      {hostsModalVisible && <Modal
+        visible
         onDismiss={() => {
           setHostsModalVisible(false);
           setHostsError(null);
@@ -3036,9 +3047,9 @@ export default function NodeDetailPage() {
             />
           </FormField>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={uploadModalVisible}
+      </Modal>}
+      {uploadModalVisible && <Modal
+        visible
         onDismiss={() => {
           setUploadModalVisible(false);
           setCertsError(null);
@@ -3074,9 +3085,9 @@ export default function NodeDetailPage() {
             <Textarea value={certChain} rows={8} placeholder={t("nodeDetail.certificateChainPlaceholder")} onChange={({ detail }) => setCertChain(detail.value)} />
           </FormField>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={deleteModalVisible}
+      </Modal>}
+      {deleteModalVisible && <Modal
+        visible
         onDismiss={() => {
           setDeleteModalVisible(false);
           setCertsError(null);
@@ -3107,9 +3118,9 @@ export default function NodeDetailPage() {
           <Box>{t("nodeDetail.confirmDeleteCertificate")}</Box>
           <Box color="text-body-secondary">{t("nodeDetail.restartRequired")}</Box>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={removeSubscriptionModalVisible}
+      </Modal>}
+      {removeSubscriptionModalVisible && <Modal
+        visible
         onDismiss={() => {
           setRemoveSubscriptionModalVisible(false);
           setSubscriptionError(null);
@@ -3131,9 +3142,9 @@ export default function NodeDetailPage() {
           ) : null}
           <Box>{t("nodeDetail.confirmRemoveSubscription")}</Box>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={fwRuleModalVisible}
+      </Modal>}
+      {fwRuleModalVisible && <Modal
+        visible
         onDismiss={() => {
           setFwRuleModalVisible(false);
           setFwError(null);
@@ -3186,9 +3197,9 @@ export default function NodeDetailPage() {
             </Button>
           </FormField>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={fwOptionsModalVisible}
+      </Modal>}
+      {fwOptionsModalVisible && <Modal
+        visible
         onDismiss={() => {
           setFwOptionsModalVisible(false);
           setFwError(null);
@@ -3221,15 +3232,15 @@ export default function NodeDetailPage() {
             <Input value={fwOptionsForm.ndp} onChange={({ detail }) => setFwOptionsForm((current) => ({ ...current, ndp: detail.value }))} />
           </FormField>
           <FormField label={t("nodeDetail.firewallLogSmurfs")}>
-            <Input value={fwOptionsForm.log_smurfs} onChange={({ detail }) => setFwOptionsForm((current) => ({ ...current, log_smurfs: detail.value }))} />
+            <Input value={fwOptionsForm.smurf_log_level} onChange={({ detail }) => setFwOptionsForm((current) => ({ ...current, smurf_log_level: detail.value }))} />
           </FormField>
           <FormField label={t("nodeDetail.firewallTcpFlagsLogLevel")}>
             <Input value={fwOptionsForm.tcp_flags_log_level} onChange={({ detail }) => setFwOptionsForm((current) => ({ ...current, tcp_flags_log_level: detail.value }))} />
           </FormField>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={fwDeleteModalVisible}
+      </Modal>}
+      {fwDeleteModalVisible && <Modal
+        visible
         onDismiss={() => {
           setFwDeleteModalVisible(false);
           setFwDeletePos(null);
@@ -3252,9 +3263,9 @@ export default function NodeDetailPage() {
           ) : null}
           <Box>{t("nodeDetail.deleteFirewallRuleConfirmation")}</Box>
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={smartModalVisible}
+      </Modal>}
+      {smartModalVisible && <Modal
+        visible
         onDismiss={() => {
           setSmartModalVisible(false);
           setSmartError(null);
@@ -3269,7 +3280,7 @@ export default function NodeDetailPage() {
               setSmartModalVisible(false);
               setSmartError(null);
               setSmartData(null);
-            }}>{t("common.close")}</Button>
+            }}>{t("common.cancel")}</Button>
           </Box>
         }
       >
@@ -3295,39 +3306,51 @@ export default function NodeDetailPage() {
             </>
           )}
         </SpaceBetween>
-      </Modal>
-      <Modal
-        visible={initGptModalVisible}
-        onDismiss={() => setInitGptModalVisible(false)}
+      </Modal>}
+      {initGptModalVisible && <Modal
+        visible
+        onDismiss={() => { if (!diskActionLoading) setInitGptModalVisible(false); }}
         header={t("nodeDetail.initGpt")}
         closeAriaLabel={t("nodeDetail.initGpt")}
         footer={
           <Box float="right">
             <SpaceBetween size="xs" direction="horizontal">
-              <Button variant="link" onClick={() => setInitGptModalVisible(false)}>{t("common.cancel")}</Button>
-              <Button variant="primary" loading={diskActionLoading} onClick={() => void runDiskAction("initgpt")}>{t("common.confirm")}</Button>
+              <Button variant="link" disabled={diskActionLoading} onClick={() => setInitGptModalVisible(false)}>{t("common.cancel")}</Button>
+              <Button variant="primary" loading={diskActionLoading} disabled={!selectedDisk || diskConfirmation !== selectedDisk.devpath} onClick={() => void runDiskAction("initgpt")}>{t("common.confirm")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <Box>{t("nodeDetail.confirmInitGpt")}</Box>
-      </Modal>
-      <Modal
-        visible={wipeDiskModalVisible}
-        onDismiss={() => setWipeDiskModalVisible(false)}
+        <SpaceBetween size="l">
+          <Alert type="warning">{t("nodeDetail.confirmInitGpt")} {selectedDisk?.devpath}</Alert>
+          <FormField label={language === "ko" ? "디스크 경로 확인" : "Confirm disk path"} description={language === "ko" ? `계속하려면 ${selectedDisk?.devpath}을(를) 입력하세요.` : `Enter ${selectedDisk?.devpath} to continue.`}>
+            <Input value={diskConfirmation} disabled={diskActionLoading} onChange={({ detail }) => setDiskConfirmation(detail.value)} autoComplete="off" />
+          </FormField>
+          {Boolean(disksError) && <Alert type="error">{disksError}</Alert>}
+        </SpaceBetween>
+      </Modal>}
+      {wipeDiskModalVisible && <Modal
+        visible
+        onDismiss={() => { if (!diskActionLoading) setWipeDiskModalVisible(false); }}
         header={t("nodeDetail.wipeDisk")}
         closeAriaLabel={t("nodeDetail.wipeDisk")}
         footer={
           <Box float="right">
             <SpaceBetween size="xs" direction="horizontal">
-              <Button variant="link" onClick={() => setWipeDiskModalVisible(false)}>{t("common.cancel")}</Button>
-              <Button variant="primary" loading={diskActionLoading} onClick={() => void runDiskAction("wipedisk")}>{t("common.confirm")}</Button>
+              <Button variant="link" disabled={diskActionLoading} onClick={() => setWipeDiskModalVisible(false)}>{t("common.cancel")}</Button>
+              <Button variant="primary" loading={diskActionLoading} disabled={!selectedDisk || diskConfirmation !== selectedDisk.devpath} onClick={() => void runDiskAction("wipedisk")}>{t("common.confirm")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <Box>{t("nodeDetail.confirmWipeDisk")}</Box>
-      </Modal>
+        <SpaceBetween size="l">
+          <Alert type="warning">{t("nodeDetail.confirmWipeDisk")} {selectedDisk?.devpath}</Alert>
+          <FormField label={language === "ko" ? "디스크 경로 확인" : "Confirm disk path"} description={language === "ko" ? `계속하려면 ${selectedDisk?.devpath}을(를) 입력하세요.` : `Enter ${selectedDisk?.devpath} to continue.`}>
+            <Input value={diskConfirmation} disabled={diskActionLoading} onChange={({ detail }) => setDiskConfirmation(detail.value)} autoComplete="off" />
+          </FormField>
+          {Boolean(disksError) && <Alert type="error">{disksError}</Alert>}
+        </SpaceBetween>
+      </Modal>}
     </SpaceBetween>
   );
 }

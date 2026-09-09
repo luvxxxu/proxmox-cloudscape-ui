@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -20,6 +22,7 @@ import Table, { type TableProps } from "@cloudscape-design/components/table";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import Textarea from "@cloudscape-design/components/textarea";
 import { useTranslation } from "@/app/lib/use-translation";
+import { buildReplicationParameters } from "@/app/lib/resource-api";
 
 interface ReplicationJob {
   id: string;
@@ -96,22 +99,7 @@ function interpolate(template: string, values: Record<string, string | number>) 
   );
 }
 
-function getMessage(responseData: unknown, fallback: string) {
-  if (typeof responseData === "string" && responseData.trim()) {
-    return responseData;
-  }
 
-  if (
-    typeof responseData === "object"
-    && responseData !== null
-    && "message" in responseData
-    && typeof responseData.message === "string"
-  ) {
-    return responseData.message;
-  }
-
-  return fallback;
-}
 
 function formatTimestamp(value?: number) {
   if (!value) {
@@ -133,7 +121,7 @@ function isDisabled(job: ReplicationJob) {
   return job.disable === 1 || job.disable === true;
 }
 
-function getStatusType(job: ReplicationJob): "success" | "stopped" | "error" | "in-progress" {
+function getStatusType(job: ReplicationJob): "success" | "stopped" | "error" | "in-progress" | "info" {
   if (job.error) {
     return "error";
   }
@@ -146,7 +134,7 @@ function getStatusType(job: ReplicationJob): "success" | "stopped" | "error" | "
     return "stopped";
   }
 
-  return "success";
+  return job.last_sync ? "success" : "info";
 }
 
 function getStatusLabel(job: ReplicationJob, t: (key: string) => string) {
@@ -170,12 +158,12 @@ function getStatusLabel(job: ReplicationJob, t: (key: string) => string) {
     return t("cluster.replication.disabled");
   }
 
-  return t("cluster.replication.ok");
+  return job.last_sync ? t("cluster.replication.ok") : t("cluster.replication.statusUnavailable");
 }
 
 function buildFormState(job: ReplicationJob): ReplicationFormState {
   return {
-    guest: String(job.guest ?? ""),
+    guest: String(job.guest ?? job.id.split("-")[0]),
     target: job.target ?? "",
     schedule: job.schedule ?? "*/15",
     rate: job.rate !== undefined ? String(job.rate) : "",
@@ -198,19 +186,8 @@ function renderCenteredState(title: string, description: string, action?: ReactN
   );
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T; message?: string } | null;
-
-  if (!response.ok) {
-    throw new Error(getMessage(json?.data ?? json?.message, interpolate(t("cluster.common.requestFailed"), { status: response.status })));
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function ClusterReplicationPage() {
@@ -239,9 +216,18 @@ export default function ClusterReplicationPage() {
   const loadJobs = useCallback(async () => {
     try {
       setLoading(true);
-      const nextJobs = await fetchProxmox<ReplicationJob[]>("/api/proxmox/cluster/replication", t);
-      setJobs((nextJobs ?? []).sort((a, b) => a.id.localeCompare(b.id)));
-      setError(null);
+      const [nextJobs, nodes] = await Promise.all([
+        fetchProxmox<ReplicationJob[]>("/api/proxmox/cluster/replication", t),
+        fetchProxmox<Array<{ node: string; status: string }>>("/api/proxmox/nodes", t),
+      ]);
+      const liveResults = await Promise.allSettled((nodes ?? []).filter((node) => node.status === "online").map(async ({ node }) => {
+        const statuses = await fetchProxmox<ReplicationJob[]>(`/api/proxmox/nodes/${encodeURIComponent(node)}/replication`, t);
+        return (statuses ?? []).map((status) => ({ ...status, source: node }));
+      }));
+      const liveJobs = new Map(liveResults.flatMap((result) => result.status === "fulfilled" ? result.value : []).map((job) => [job.id, job]));
+      setJobs((nextJobs ?? []).map((job) => ({ ...job, ...liveJobs.get(job.id), guest: job.guest ?? job.id.split("-")[0] })).sort((a, b) => a.id.localeCompare(b.id)));
+      const errors = liveResults.flatMap((result) => result.status === "rejected" ? [result.reason instanceof Error ? result.reason.message : String(result.reason)] : []);
+      setError(errors.length ? errors.join("; ") : null);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : t("cluster.replication.failedToLoad"));
     } finally {
@@ -249,7 +235,10 @@ export default function ClusterReplicationPage() {
     }
   }, [t]);
 
+  useResourceTaskRefresh(loadJobs);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadJobs();
   }, [loadJobs]);
 
@@ -257,36 +246,8 @@ export default function ClusterReplicationPage() {
 
   const submitJob = useCallback(async (mode: "create" | "edit") => {
     try {
-      const guest = form.guest.trim();
-      const target = form.target.trim();
-      const schedule = form.schedule.trim() || "*/15";
-
-      if (!guest) {
-        throw new Error(t("cluster.replication.guestRequired"));
-      }
-
-      if (!target) {
-        throw new Error(t("cluster.replication.targetRequired"));
-      }
-
+      const params = buildReplicationParameters(form, mode, jobs.map((job) => job.id));
       setSubmitting(true);
-
-      const params = new URLSearchParams();
-      params.set("guest", guest);
-      params.set("target", target);
-      params.set("schedule", schedule);
-      params.set("type", form.type || "local");
-
-      const rate = form.rate.trim();
-      const comment = form.comment.trim();
-
-      if (rate) {
-        params.set("rate", rate);
-      }
-
-      if (comment) {
-        params.set("comment", comment);
-      }
 
       if (mode === "create") {
         await fetchProxmox<string>("/api/proxmox/cluster/replication", t, {
@@ -321,7 +282,7 @@ export default function ClusterReplicationPage() {
     } finally {
       setSubmitting(false);
     }
-  }, [addFlash, form, loadJobs, selectedJob, t]);
+  }, [addFlash, form, jobs, loadJobs, selectedJob, t]);
 
   const deleteJob = useCallback(async () => {
     if (!selectedJob) {
@@ -342,6 +303,20 @@ export default function ClusterReplicationPage() {
       setSubmitting(false);
     }
   }, [addFlash, loadJobs, selectedJob, t]);
+
+  const runJobNow = useCallback(async (job: ReplicationJob) => {
+    if (!job.source || isDisabled(job)) return;
+    try {
+      setSubmitting(true);
+      await fetchProxmox(`/api/proxmox/nodes/${encodeURIComponent(job.source)}/replication/${encodeURIComponent(job.id)}/schedule_now`, t, { method: "POST" });
+      addFlash({ id: `replication-run-${job.id}`, type: "success", content: t("cluster.replication.runQueued"), dismissible: true });
+      await loadJobs();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : t("common.error"));
+    } finally {
+      setSubmitting(false);
+    }
+  }, [addFlash, loadJobs, t]);
 
   const columns = useMemo<TableProps<ReplicationJob>["columnDefinitions"]>(
     () => [
@@ -368,6 +343,7 @@ export default function ClusterReplicationPage() {
         header: t("common.actions"),
         cell: (job) => (
           <SpaceBetween direction="horizontal" size="xs">
+            <Button variant="inline-link" disabled={submitting || !job.source || isDisabled(job)} onClick={() => void runJobNow(job)}>{t("cluster.replication.runNow")}</Button>
             <Button
               variant="inline-link"
               onClick={() => {
@@ -392,7 +368,7 @@ export default function ClusterReplicationPage() {
         minWidth: 160,
       },
     ],
-    [t],
+    [runJobNow, submitting, t],
   );
 
   const emptyState = renderCenteredState(
@@ -429,6 +405,7 @@ export default function ClusterReplicationPage() {
       noMatch: renderCenteredState(
         t("common.noMatches"),
         t("cluster.replication.noJobsMatch"),
+        // eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions.
         <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>,
       ),
     },
@@ -584,6 +561,7 @@ export default function ClusterReplicationPage() {
         }
       >
         <SpaceBetween size="m">
+          {error ? <Alert type="error">{error}</Alert> : null}
           <FormField label={t("cluster.replication.guestId")}>
             <Input value={form.guest} onChange={({ detail }) => setForm((current) => ({ ...current, guest: detail.value }))} />
           </FormField>
@@ -623,6 +601,7 @@ export default function ClusterReplicationPage() {
         }
       >
         <SpaceBetween size="m">
+          {error ? <Alert type="error">{error}</Alert> : null}
           <FormField label={t("cluster.replication.jobId")}>
             <Input value={selectedJob?.id ?? ""} disabled />
           </FormField>
@@ -630,7 +609,7 @@ export default function ClusterReplicationPage() {
             <Input value={form.guest} disabled />
           </FormField>
           <FormField label={t("cluster.replication.targetNode")}>
-            <Input value={form.target} placeholder={t("cluster.replication.targetNodePlaceholder")} onChange={({ detail }) => setForm((current) => ({ ...current, target: detail.value }))} />
+            <Input disabled value={form.target} placeholder={t("cluster.replication.targetNodePlaceholder")} onChange={({ detail }) => setForm((current) => ({ ...current, target: detail.value }))} />
           </FormField>
           <FormField label={t("cluster.replication.schedule")}>
             <Input value={form.schedule} placeholder={t("cluster.replication.schedulePlaceholder")} onChange={({ detail }) => setForm((current) => ({ ...current, schedule: detail.value }))} />
@@ -643,6 +622,7 @@ export default function ClusterReplicationPage() {
           </FormField>
           <FormField label={t("cluster.replication.type")}>
             <Select
+              disabled
               selectedOption={typeOptions.find((option) => option.value === form.type) ?? null}
               options={typeOptions}
               onChange={({ detail }) => setForm((current) => ({ ...current, type: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "local" }))}

@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource } from "@/app/lib/resource-request";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -58,29 +60,9 @@ const EMPTY_FORM: OptionsFormState = {
   description: "",
 };
 
-function interpolate(template: string, values: Record<string, string | number>) {
-  return Object.entries(values).reduce(
-    (result, [key, value]) => result.replaceAll(`{${key}}`, String(value)),
-    template,
-  );
-}
 
-function getMessage(responseData: unknown, fallback: string) {
-  if (typeof responseData === "string" && responseData.trim()) {
-    return responseData;
-  }
 
-  if (
-    typeof responseData === "object"
-    && responseData !== null
-    && "message" in responseData
-    && typeof responseData.message === "string"
-  ) {
-    return responseData.message;
-  }
 
-  return fallback;
-}
 
 function parseConfigValue(value?: string) {
   return (value ?? "")
@@ -118,19 +100,8 @@ function buildFormState(options: ClusterOptions): OptionsFormState {
   };
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T; message?: string } | null;
-
-  if (!response.ok) {
-    throw new Error(getMessage(json?.data ?? json?.message, interpolate(t("cluster.common.requestFailed"), { status: response.status })));
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function ClusterOptionsPage() {
@@ -167,6 +138,7 @@ export default function ClusterOptionsPage() {
   }, [t]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadOptions();
   }, [loadOptions]);
 

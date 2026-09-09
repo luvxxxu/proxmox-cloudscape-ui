@@ -1,5 +1,9 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
+import { isStorageActive, poolMemberVmid } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -113,9 +117,7 @@ function getStatusType(status?: string) {
   return "info" as const;
 }
 
-function isStorageActive(storage: Pick<PveStorage, "active" | "status">) {
-  return storage.active === 1 || storage.status === "active" || storage.status === undefined;
-}
+
 
 function optionValue(option: SelectProps.Option | null) {
   return typeof option?.value === "string" ? option.value : "";
@@ -132,22 +134,8 @@ function getMemberLabel(member: PoolMember, t: (key: string) => string) {
   return `${typeLabel} ${primaryId}${suffix}`;
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T } | null;
-
-  if (!response.ok) {
-    const message = typeof json?.data === "string"
-      ? json.data
-      : interpolate(t("pools.requestFailed"), { status: response.status });
-    throw new Error(message);
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function PoolsPage() {
@@ -223,7 +211,10 @@ export default function PoolsPage() {
     }
   }, [t]);
 
+  useResourceTaskRefresh(loadData);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadData();
   }, [loadData]);
 
@@ -415,7 +406,7 @@ export default function PoolsPage() {
       if (member.type === "storage") {
         body.set("storage", member.storage ?? member.id);
       } else {
-        body.set("vms", member.id);
+        body.set("vms", poolMemberVmid(member));
       }
       body.set("delete", "1");
 
@@ -490,6 +481,7 @@ export default function PoolsPage() {
         <Box variant="p" color="inherit">
           {t("pools.noPoolsMatch")}
         </Box>
+        {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
         <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
       </SpaceBetween>
     </Box>

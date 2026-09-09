@@ -1,6 +1,12 @@
 "use client";
 
-import { use, useCallback, useEffect, useMemo, useState } from "react";
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+import { GuestPowerConfirmation, type GuestPowerAction } from "@/app/lib/guest-power-confirmation";
+import { useSettings } from "@/app/components/settings-context";
+
+import { formatResourceBytes as formatBytes, isStorageActive, isValidVmid, setOptionalParameters, readPropertyValue, updatePropertyValue, isIntegerInRange } from "@/app/lib/resource-api";
+
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
 import AreaChart from "@cloudscape-design/components/area-chart";
@@ -90,6 +96,8 @@ interface ClusterNextId {
 interface StorageSummary {
   storage: string;
   content?: string;
+  active?: number;
+  enabled?: number;
 }
 
 interface VmOptionsFormState {
@@ -178,13 +186,7 @@ const EMPTY_VM_FIREWALL_OPTIONS_FORM: VmFirewallOptionsFormState = {
   policyOut: "ACCEPT",
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
+
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
@@ -286,10 +288,10 @@ function buildVmOptionsForm(config: VmConfig): VmOptionsFormState {
   return {
     boot: getConfigStringValue(config.boot),
     onboot: isEnabled(config.onboot),
-    agent: isEnabled(config.agent),
+    agent: isEnabled(readPropertyValue(config.agent, "enabled")),
     protection: isEnabled(config.protection),
     hotplug: getConfigStringValue(config.hotplug),
-    tablet: isEnabled(config.tablet),
+    tablet: isEnabled(config.tablet ?? 1),
     localtime: isEnabled(config.localtime),
   };
 }
@@ -302,7 +304,7 @@ function buildVmCloudInitForm(config: VmConfig): VmCloudInitFormState {
     searchdomain: getConfigStringValue(config.searchdomain),
     sshkeys: decodeUrlValue(getConfigStringValue(config.sshkeys)),
     ipconfig0: getConfigStringValue(config.ipconfig0),
-    citype: getConfigStringValue(config.citype) || "nocloud",
+    citype: getConfigStringValue(config.citype) || (/^w/.test(getConfigStringValue(config.ostype)) ? "configdrive2" : "nocloud"),
   };
 }
 
@@ -323,14 +325,14 @@ function buildVmFirewallOptionsForm(options: VmFirewallOptions): VmFirewallOptio
   return {
     enable: isEnabled(options.enable),
     dhcp: isEnabled(options.dhcp),
-    macfilter: isEnabled(options.macfilter),
+    macfilter: isEnabled(options.macfilter ?? 1),
     policyIn: options.policy_in ?? "DROP",
     policyOut: options.policy_out ?? "ACCEPT",
   };
 }
 
 function storageSupportsContent(storage: StorageSummary, contentType: string): boolean {
-  return (storage.content ?? "")
+  return isStorageActive(storage) && (storage.content ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .includes(contentType);
@@ -359,34 +361,25 @@ function getHardwareItems(config: VmConfig, t: (key: string) => string) {
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T | string } | null;
-
-  if (!response.ok) {
-    throw new Error(typeof json?.data === "string" ? json.data : `Request failed with status ${response.status}`);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path, init);
 }
 
 export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid: string }> }) {
-  const router = useRouter();
-  const { t } = useTranslation();
   const { vmid } = use(props.params);
+  return <VmDetails key={vmid} vmid={vmid} />;
+}
+
+function VmDetails({ vmid }: { vmid: string }) {
+  const router = useRouter();
+  const { confirmPowerActions } = useSettings();
+  const [pendingPowerAction, setPendingPowerAction] = useState<GuestPowerAction | null>(null);
+  const { t } = useTranslation();
   const [activeTabId, setActiveTabId] = useState("summary");
   const [data, setData] = useState<VmDetailData | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [actionLoading, setActionLoading] = useState<"start" | "stop" | "reboot" | null>(null);
+  const [actionLoading, setActionLoading] = useState<GuestPowerAction | null>(null);
   const [flashbarItems, setFlashbarItems] = useState<FlashbarProps.MessageDefinition[]>([]);
   const [configError, setConfigError] = useState<string | null>(null);
   const [editModalVisible, setEditModalVisible] = useState(false);
@@ -469,17 +462,23 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
     setFlashbarItems((current) => [item, ...current.filter((entry) => entry.id !== item.id)].slice(0, 5));
   }, []);
 
+  const detailRequest = useRef<AbortController | null>(null);
+  const loadedNode = useRef<string | null>(null);
+
   const loadVm = useCallback(async () => {
-    if (!Number.isFinite(numericVmid)) {
+    if (!isValidVmid(vmid)) {
       setLoadError(t("vms.invalidVmid"));
       setLoading(false);
       return;
     }
 
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
     try {
       setLoading(true);
       setActionError(null);
-      const resources = await fetchProxmox<ClusterVmResource[]>("/api/proxmox/cluster/resources?type=vm");
+      const resources = await fetchProxmox<ClusterVmResource[]>("/api/proxmox/cluster/resources?type=vm", { signal: controller.signal });
       const resource = (resources ?? []).find((item) => item.type === "qemu" && item.vmid === numericVmid && item.node);
 
       if (!resource?.node) {
@@ -487,13 +486,28 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       }
 
       const [status, rrd, config, snapshots, tasks] = await Promise.all([
-        fetchProxmox<VmStatus>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/status/current`),
-        fetchProxmox<VmRrdPoint[]>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/rrddata?timeframe=hour&cf=AVERAGE`),
-        fetchProxmox<VmConfig>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/config`),
-        fetchProxmox<VmSnapshot[]>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/snapshot`),
-        fetchProxmox<VmTask[]>(`/api/proxmox/nodes/${resource.node}/tasks?vmid=${numericVmid}&limit=20`),
+        fetchProxmox<VmStatus>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/status/current`, { signal: controller.signal }),
+        fetchProxmox<VmRrdPoint[]>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/rrddata?timeframe=hour&cf=AVERAGE`, { signal: controller.signal }),
+        fetchProxmox<VmConfig>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/config`, { signal: controller.signal }),
+        fetchProxmox<VmSnapshot[]>(`/api/proxmox/nodes/${resource.node}/qemu/${numericVmid}/snapshot`, { signal: controller.signal }),
+        fetchProxmox<VmTask[]>(`/api/proxmox/nodes/${resource.node}/tasks?vmid=${numericVmid}&limit=20`, { signal: controller.signal }),
       ]);
 
+      if (controller.signal.aborted) return;
+      if (loadedNode.current !== resource.node) {
+        setFirewallLoaded(false);
+        setFirewallRules([]);
+        setFirewallOptions(null);
+        setFirewallRulesError(null);
+        setFirewallOptionsError(null);
+        setBackupsLoaded(false);
+        setBackups([]);
+        setBackupsError(null);
+        setFirewallRulesLoading(false);
+        setFirewallOptionsLoading(false);
+        setBackupsLoading(false);
+        loadedNode.current = resource.node;
+      }
       setData({
         node: resource.node,
         status: {
@@ -507,18 +521,24 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       });
       setLoadError(null);
     } catch (fetchError) {
+      if (controller.signal.aborted) return;
       setLoadError(fetchError instanceof Error ? fetchError.message : t("vms.failedToLoadDetails"));
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
-  }, [numericVmid, t]);
+  }, [numericVmid, t, vmid]);
+
+  useResourceTaskRefresh(loadVm);
 
   useEffect(() => {
+    // Start an external request; loading state belongs to its asynchronous lifecycle.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadVm();
+    return () => detailRequest.current?.abort();
   }, [loadVm]);
 
   const selectedStatus = data?.status.status;
-  const canStart = selectedStatus === "stopped" && !actionLoading;
+  const canStart = selectedStatus === "stopped" && !isEnabled(data?.config.template) && !actionLoading;
   const canStop = selectedStatus === "running" && !actionLoading;
   const canReboot = selectedStatus === "running" && !actionLoading;
   const canOpenConsole = selectedStatus === "running" && !actionLoading;
@@ -554,49 +574,25 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       .sort((left, right) => String(left.label).localeCompare(String(right.label)));
   }, []);
 
-  const runPowerAction = useCallback(
-    async (action: "start" | "stop" | "reboot") => {
-      if (!data) {
-        return;
-      }
+  const runPowerAction = useCallback(async (action: GuestPowerAction) => {
+    if (!data) return;
+    try {
+      setActionLoading(action);
+      setActionError(null);
+      await fetchProxmox(`/api/proxmox/nodes/${encodeURIComponent(data.node)}/qemu/${numericVmid}/status/${action}`, { method: "POST" });
+      await loadVm();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : t("common.error"));
+    } finally {
+      setActionLoading(null);
+      setPendingPowerAction(null);
+    }
+  }, [data, loadVm, numericVmid, t]);
 
-      const expectedStatus = action === "stop" ? "stopped" : "running";
-
-      try {
-        setActionLoading(action);
-        setActionError(null);
-        await fetchProxmox(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/status/${action}`, {
-          method: "POST",
-          body: JSON.stringify({}),
-        });
-
-        for (let i = 0; i < 15; i++) {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          try {
-            const resources = await fetchProxmox<ClusterVmResource[]>("/api/proxmox/cluster/resources?type=vm");
-            const resource = (resources ?? []).find((item) => item.type === "qemu" && item.vmid === numericVmid);
-            if (resource) {
-              const transitioned = action === "reboot"
-                ? resource.status === "running"
-                : resource.status === expectedStatus;
-
-              if (transitioned) {
-                await loadVm();
-                break;
-              }
-            }
-        } catch {
-          void 0;
-        }
-      }
-    } catch (actionError) {
-        setActionError(actionError instanceof Error ? actionError.message : t("vms.failedAction").replace("{action}", action));
-      } finally {
-        setActionLoading(null);
-      }
-    },
-    [data, loadVm, numericVmid, t],
-  );
+  const requestPowerAction = (action: GuestPowerAction) => {
+    if (!confirmPowerActions && action !== "stop") void runPowerAction(action);
+    else setPendingPowerAction(action);
+  };
 
   const openEditModal = useCallback(() => {
     if (!data) {
@@ -605,7 +601,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
 
     setEditCores(getConfigStringValue(data.config.cores));
     setEditSockets(getConfigStringValue(data.config.sockets));
-    setEditMemory(getConfigStringValue(data.config.memory));
+    setEditMemory(readPropertyValue(data.config.memory, "current"));
     setEditDescription(getConfigStringValue(data.config.description));
     setConfigError(null);
     setEditModalVisible(true);
@@ -632,7 +628,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
     const sockets = Number(editSockets);
     const memory = Number(editMemory);
 
-    if (!Number.isFinite(cores) || cores <= 0 || !Number.isFinite(sockets) || sockets <= 0 || !Number.isFinite(memory) || memory <= 0) {
+    if (!isIntegerInRange(editCores, 1) || !isIntegerInRange(editSockets, 1) || !isIntegerInRange(editMemory, 16)) {
       setConfigError(t("vms.coresSocketsMemoryError"));
       return;
     }
@@ -644,7 +640,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       const body = new URLSearchParams({
         cores: String(cores),
         sockets: String(sockets),
-        memory: String(memory),
+        memory: getConfigStringValue(data.config.memory).includes("=") ? updatePropertyValue(data.config.memory, "current", String(memory)) : String(memory),
         description: editDescription,
       });
 
@@ -857,7 +853,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       setSnapshotLoading(true);
       setSnapshotError(null);
 
-      await fetchProxmox(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/snapshot/${selectedSnapshot.name}`, {
+      await fetchProxmox(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/snapshot/${encodeURIComponent(selectedSnapshot.name)}`, {
         method: "DELETE",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -892,7 +888,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       setSnapshotLoading(true);
       setSnapshotError(null);
 
-      await fetchProxmox(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/snapshot/${selectedSnapshot.name}/rollback`, {
+      await fetchProxmox(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/snapshot/${encodeURIComponent(selectedSnapshot.name)}/rollback`, {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -921,11 +917,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
   useEffect(() => {
     const targetNode = optionValue(cloneTargetNode);
 
-    if (!cloneModalVisible || !targetNode) {
-      setAvailableStorages([]);
-      setCloneTargetStorage(null);
-      return;
-    }
+    if (!cloneModalVisible || !targetNode) return;
 
     let cancelled = false;
 
@@ -1019,7 +1011,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
     const targetStorage = optionValue(cloneTargetStorage);
     const fullClone = optionValue(cloneFullClone) !== "linked";
 
-    if (!newId) {
+    if (!isValidVmid(newId)) {
       setCloneError(t("vms.newIdRequired"));
       return;
     }
@@ -1146,15 +1138,18 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       return;
     }
 
+    const requestNode = data.node;
     try {
       setFirewallRulesLoading(true);
       const nextRules = await fetchProxmox<VmFirewallRule[]>(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/firewall/rules`);
+      if (loadedNode.current !== requestNode) return;
       setFirewallRules((nextRules ?? []).slice().sort((left, right) => left.pos - right.pos));
       setFirewallRulesError(null);
     } catch (loadError) {
+      if (loadedNode.current !== requestNode) return;
       setFirewallRulesError(loadError instanceof Error ? loadError.message : t("vms.failedToLoadFirewallRules"));
     } finally {
-      setFirewallRulesLoading(false);
+      if (loadedNode.current === requestNode) setFirewallRulesLoading(false);
     }
   }, [data, numericVmid, t]);
 
@@ -1163,21 +1158,24 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       return;
     }
 
+    const requestNode = data.node;
     try {
       setFirewallOptionsLoading(true);
       const nextOptions = await fetchProxmox<VmFirewallOptions>(`/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/firewall/options`);
+      if (loadedNode.current !== requestNode) return;
       setFirewallOptions(nextOptions ?? {});
       setFirewallOptionsError(null);
     } catch (loadError) {
+      if (loadedNode.current !== requestNode) return;
       setFirewallOptionsError(loadError instanceof Error ? loadError.message : t("vms.failedToLoadFirewallOptions"));
     } finally {
-      setFirewallOptionsLoading(false);
+      if (loadedNode.current === requestNode) setFirewallOptionsLoading(false);
     }
   }, [data, numericVmid, t]);
 
   const loadFirewallData = useCallback(async () => {
-    await Promise.all([loadFirewallRules(), loadFirewallOptions()]);
     setFirewallLoaded(true);
+    await Promise.all([loadFirewallRules(), loadFirewallOptions()]);
   }, [loadFirewallOptions, loadFirewallRules]);
 
   const loadBackups = useCallback(async () => {
@@ -1185,7 +1183,9 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       return;
     }
 
+    const requestNode = data.node;
     try {
+      setBackupsLoaded(true);
       setBackupsLoading(true);
       const storages = await fetchProxmox<StorageSummary[]>(`/api/proxmox/nodes/${data.node}/storage`);
       const backupStorages = (storages ?? []).filter((storage) => storageSupportsContent(storage, "backup"));
@@ -1200,6 +1200,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
         }),
       );
 
+      if (loadedNode.current !== requestNode) return;
       setBackups(
         backupResults
           .flat()
@@ -1207,30 +1208,23 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       );
       setBackupsError(null);
     } catch (loadError) {
+      if (loadedNode.current !== requestNode) return;
       setBackupsError(loadError instanceof Error ? loadError.message : t("vms.failedToLoadBackups"));
     } finally {
-      setBackupsLoading(false);
+      if (loadedNode.current === requestNode) setBackupsLoading(false);
     }
   }, [data, numericVmid, t]);
 
-  useEffect(() => {
-    setFirewallLoaded(false);
-    setFirewallRules([]);
-    setFirewallOptions(null);
-    setFirewallRulesError(null);
-    setFirewallOptionsError(null);
-    setBackupsLoaded(false);
-    setBackups([]);
-    setBackupsError(null);
-  }, [data?.node, numericVmid]);
 
   useEffect(() => {
     if (activeTabId === "firewall" && data && !firewallLoaded && !firewallRulesLoading && !firewallOptionsLoading) {
+      // Start the selected tab’s external request; loaded/loading flags prevent repeat calls.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       void loadFirewallData();
     }
 
     if (activeTabId === "backup" && data && !backupsLoaded && !backupsLoading) {
-      void loadBackups().then(() => setBackupsLoaded(true));
+      void loadBackups();
     }
   }, [activeTabId, backupsLoaded, backupsLoading, data, firewallLoaded, firewallOptionsLoading, firewallRulesLoading, loadBackups, loadFirewallData]);
 
@@ -1264,11 +1258,10 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       setOptionsFormError(null);
 
       const params = new URLSearchParams();
-      params.set("boot", optionsForm.boot);
+      setOptionalParameters(params, { boot: optionsForm.boot, hotplug: optionsForm.hotplug }, true);
       params.set("onboot", optionsForm.onboot ? "1" : "0");
-      params.set("agent", optionsForm.agent ? "1" : "0");
+      params.set("agent", updatePropertyValue(data.config.agent, "enabled", optionsForm.agent ? "1" : "0"));
       params.set("protection", optionsForm.protection ? "1" : "0");
-      params.set("hotplug", optionsForm.hotplug);
       params.set("tablet", optionsForm.tablet ? "1" : "0");
       params.set("localtime", optionsForm.localtime ? "1" : "0");
 
@@ -1297,11 +1290,13 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       setCloudInitFormError(null);
 
       const params = new URLSearchParams();
-      params.set("ciuser", cloudInitForm.ciuser);
-      params.set("nameserver", cloudInitForm.nameserver);
-      params.set("searchdomain", cloudInitForm.searchdomain);
-      params.set("sshkeys", cloudInitForm.sshkeys);
-      params.set("ipconfig0", cloudInitForm.ipconfig0);
+      setOptionalParameters(params, {
+        ciuser: cloudInitForm.ciuser,
+        nameserver: cloudInitForm.nameserver,
+        searchdomain: cloudInitForm.searchdomain,
+        sshkeys: cloudInitForm.sshkeys.trim() ? encodeURIComponent(cloudInitForm.sshkeys.trim()) : "",
+        ipconfig0: cloudInitForm.ipconfig0,
+      }, true);
       params.set("citype", cloudInitForm.citype || "nocloud");
       if (cloudInitForm.cipassword.trim()) {
         params.set("cipassword", cloudInitForm.cipassword);
@@ -1367,11 +1362,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
       params.set("type", firewallRuleForm.type || "in");
       params.set("action", firewallRuleForm.action || "ACCEPT");
       params.set("enable", firewallRuleForm.enable ? "1" : "0");
-      if (firewallRuleForm.proto.trim()) params.set("proto", firewallRuleForm.proto.trim());
-      if (firewallRuleForm.source.trim()) params.set("source", firewallRuleForm.source.trim());
-      if (firewallRuleForm.dest.trim()) params.set("dest", firewallRuleForm.dest.trim());
-      if (firewallRuleForm.dport.trim()) params.set("dport", firewallRuleForm.dport.trim());
-      if (firewallRuleForm.comment.trim()) params.set("comment", firewallRuleForm.comment.trim());
+      setOptionalParameters(params, { proto: firewallRuleForm.proto, source: firewallRuleForm.source, dest: firewallRuleForm.dest, dport: firewallRuleForm.dport, comment: firewallRuleForm.comment }, firewallRuleModalMode === "edit");
 
       const path = firewallRuleModalMode === "create"
         ? `/api/proxmox/nodes/${data.node}/qemu/${numericVmid}/firewall/rules`
@@ -1614,10 +1605,10 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
     return [
       { label: t("vms.bootOrder"), value: getTextValue(getConfigStringValue(config.boot)) },
       { label: t("vms.startOnBoot"), value: isEnabled(config.onboot) ? t("common.yes") : t("common.no") },
-      { label: t("vms.qemuAgentLabel"), value: isEnabled(config.agent) ? t("common.yes") : t("common.no") },
+      { label: t("vms.qemuAgentLabel"), value: isEnabled(readPropertyValue(config.agent, "enabled")) ? t("common.yes") : t("common.no") },
       { label: t("vms.protection"), value: isEnabled(config.protection) ? t("common.yes") : t("common.no") },
       { label: t("vms.hotplug"), value: getTextValue(getConfigStringValue(config.hotplug)) },
-      { label: t("vms.tabletDevice"), value: isEnabled(config.tablet) ? t("common.yes") : t("common.no") },
+      { label: t("vms.tabletDevice"), value: isEnabled(config.tablet ?? 1) ? t("common.yes") : t("common.no") },
       { label: t("vms.useLocalTime"), value: isEnabled(config.localtime) ? t("common.yes") : t("common.no") },
     ];
   }, [data?.config, t]);
@@ -1639,7 +1630,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
 
   const firewallOptionDetails = firewallOptions ? buildVmFirewallOptionsForm(firewallOptions) : EMPTY_VM_FIREWALL_OPTIONS_FORM;
 
-  if (!Number.isFinite(numericVmid)) {
+  if (!isValidVmid(String(numericVmid))) {
     return (
       <SpaceBetween size="m">
         <Header variant="h1">{t("vms.virtualMachines")}</Header>
@@ -1896,7 +1887,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
               <KeyValuePairs
                 columns={2}
                 items={[
-                  { label: t("vms.firewallEnabled"), value: firewallOptionDetails.enable ? t("common.yes") : t("common.no") },
+                  { label: t("firewall.enabled"), value: firewallOptionDetails.enable ? t("common.yes") : t("common.no") },
                   { label: t("vms.dhcp"), value: firewallOptionDetails.dhcp ? t("common.yes") : t("common.no") },
                   { label: t("vms.macFilter"), value: firewallOptionDetails.macfilter ? t("common.yes") : t("common.no") },
                   { label: t("firewall.policyIn"), value: firewallActionLabel(firewallOptionDetails.policyIn) },
@@ -1947,7 +1938,8 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
 
   return (
     <SpaceBetween size="m">
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      <GuestPowerConfirmation action={pendingPowerAction} guests={[{ vmid: numericVmid, name: data.status.name }]} busy={actionLoading !== null} onDismiss={() => setPendingPowerAction(null)} onConfirm={() => { if (pendingPowerAction) void runPowerAction(pendingPowerAction); }} />
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, dismissLabel: item.dismissLabel ?? t("common.close"), onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry !== item))) }))} /> : null}
       {actionError ? (
         <Alert type="error" header={t("vms.actionFailed")}>
           {actionError}
@@ -1968,13 +1960,16 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
         description={`${t("vms.vmid")} ${numericVmid}`}
         actions={
           <SpaceBetween size="xs" direction="horizontal">
-            <Button loading={actionLoading === "start"} disabled={!canStart} onClick={() => void runPowerAction("start")}>
+            <Button loading={actionLoading === "start"} disabled={!canStart} onClick={() => requestPowerAction("start")}>
               {t("vms.start")}
             </Button>
-            <Button loading={actionLoading === "stop"} disabled={!canStop} onClick={() => void runPowerAction("stop")}>
+            <Button loading={actionLoading === "shutdown"} disabled={!canStop} onClick={() => requestPowerAction("shutdown")}>
+              {t("nodeDetail.shutdown")}
+            </Button>
+            <Button loading={actionLoading === "stop"} disabled={!canStop} onClick={() => requestPowerAction("stop")}>
               {t("vms.stop")}
             </Button>
-            <Button loading={actionLoading === "reboot"} disabled={!canReboot} onClick={() => void runPowerAction("reboot")}>
+            <Button loading={actionLoading === "reboot"} disabled={!canReboot} onClick={() => requestPowerAction("reboot")}>
               {t("vms.reboot")}
             </Button>
             <Button disabled={!!actionLoading} onClick={() => void openMigrateModal()}>
@@ -2189,7 +2184,7 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
         <SpaceBetween size="m">
           {firewallActionError ? <Alert type="error">{firewallActionError}</Alert> : null}
           <Toggle checked={firewallOptionsForm.enable} onChange={({ detail }) => setFirewallOptionsForm((current) => ({ ...current, enable: detail.checked }))}>
-            {t("vms.firewallEnabled")}
+            {t("firewall.enabled")}
           </Toggle>
           <Toggle checked={firewallOptionsForm.dhcp} onChange={({ detail }) => setFirewallOptionsForm((current) => ({ ...current, dhcp: detail.checked }))}>
             {t("vms.dhcp")}
@@ -2332,7 +2327,11 @@ export default function VirtualMachineDetailPage(props: { params: Promise<{ vmid
           <FormField label={t("vms.targetNode")}>
             <Select
               selectedOption={cloneTargetNode}
-              onChange={({ detail }) => setCloneTargetNode(detail.selectedOption)}
+              onChange={({ detail }) => {
+                setCloneTargetNode(detail.selectedOption);
+                setCloneTargetStorage(null);
+                setAvailableStorages([]);
+              }}
               options={availableNodes}
               placeholder={t("vms.targetNode")}
               statusType={loadingNodes ? "loading" : "finished"}

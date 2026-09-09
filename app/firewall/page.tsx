@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource } from "@/app/lib/resource-request";
+
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -23,6 +25,7 @@ import Tabs from "@cloudscape-design/components/tabs";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import Textarea from "@cloudscape-design/components/textarea";
 import { useTranslation } from "@/app/lib/use-translation";
+import { setOptionalParameters } from "@/app/lib/resource-api";
 
 interface FirewallRule {
   pos: number;
@@ -219,22 +222,7 @@ function interpolate(template: string, values: Record<string, string | number>) 
   );
 }
 
-function getMessage(responseData: unknown, fallback: string) {
-  if (typeof responseData === "string" && responseData.trim()) {
-    return responseData;
-  }
 
-  if (
-    typeof responseData === "object"
-    && responseData !== null
-    && "message" in responseData
-    && typeof responseData.message === "string"
-  ) {
-    return responseData.message;
-  }
-
-  return fallback;
-}
 
 function isEnabled(value?: number | boolean) {
   return value === 1 || value === true;
@@ -261,7 +249,7 @@ function buildOptionsForm(options: FirewallOptions): OptionsFormState {
     policyIn: options.policy_in ?? "DROP",
     policyOut: options.policy_out ?? "ACCEPT",
     logRateLimit: options.log_ratelimit ?? "",
-    ebtables: isEnabled(options.ebtables),
+    ebtables: isEnabled(options.ebtables ?? 1),
   };
 }
 
@@ -292,19 +280,8 @@ function updatePreferences(
   }));
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T; message?: string } | null;
-
-  if (!response.ok) {
-    throw new Error(getMessage(json?.data ?? json?.message, interpolate(t("cluster.common.requestFailed"), { status: response.status })));
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 function encodeFormBody(params: URLSearchParams) {
@@ -468,6 +445,7 @@ export default function FirewallPage() {
   }, [loadAliases, loadGroups, loadIpSets, loadOptions, loadRules]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadAll();
   }, [loadAll]);
 
@@ -878,13 +856,7 @@ export default function FirewallPage() {
       params.set("type", ruleForm.type || "in");
       params.set("action", ruleForm.action || "ACCEPT");
       params.set("enable", ruleForm.enable ? "1" : "0");
-      if (ruleForm.macro.trim()) params.set("macro", ruleForm.macro.trim());
-      if (ruleForm.proto.trim()) params.set("proto", ruleForm.proto.trim());
-      if (ruleForm.source.trim()) params.set("source", ruleForm.source.trim());
-      if (ruleForm.dest.trim()) params.set("dest", ruleForm.dest.trim());
-      if (ruleForm.dport.trim()) params.set("dport", ruleForm.dport.trim());
-      if (ruleForm.sport.trim()) params.set("sport", ruleForm.sport.trim());
-      if (ruleForm.comment.trim()) params.set("comment", ruleForm.comment.trim());
+      setOptionalParameters(params, { macro: ruleForm.macro, proto: ruleForm.proto, source: ruleForm.source, dest: ruleForm.dest, dport: ruleForm.dport, sport: ruleForm.sport, comment: ruleForm.comment }, mode === "edit");
 
       const path = mode === "create" ? "/api/proxmox/cluster/firewall/rules" : `/api/proxmox/cluster/firewall/rules/${selectedRule?.pos ?? 0}`;
       await fetchProxmox<string>(path, t, { method: mode === "create" ? "POST" : "PUT", ...encodeFormBody(params) });
@@ -932,7 +904,7 @@ export default function FirewallPage() {
       params.set("policy_in", optionsForm.policyIn || "DROP");
       params.set("policy_out", optionsForm.policyOut || "ACCEPT");
       params.set("ebtables", optionsForm.ebtables ? "1" : "0");
-      if (optionsForm.logRateLimit.trim()) params.set("log_ratelimit", optionsForm.logRateLimit.trim());
+      setOptionalParameters(params, { log_ratelimit: optionsForm.logRateLimit }, true);
 
       await fetchProxmox<string>("/api/proxmox/cluster/firewall/options", t, { method: "PUT", ...encodeFormBody(params) });
 
@@ -1048,13 +1020,7 @@ export default function FirewallPage() {
       params.set("type", ruleForm.type || "in");
       params.set("action", ruleForm.action || "ACCEPT");
       params.set("enable", ruleForm.enable ? "1" : "0");
-      if (ruleForm.macro.trim()) params.set("macro", ruleForm.macro.trim());
-      if (ruleForm.proto.trim()) params.set("proto", ruleForm.proto.trim());
-      if (ruleForm.source.trim()) params.set("source", ruleForm.source.trim());
-      if (ruleForm.dest.trim()) params.set("dest", ruleForm.dest.trim());
-      if (ruleForm.dport.trim()) params.set("dport", ruleForm.dport.trim());
-      if (ruleForm.sport.trim()) params.set("sport", ruleForm.sport.trim());
-      if (ruleForm.comment.trim()) params.set("comment", ruleForm.comment.trim());
+      setOptionalParameters(params, { macro: ruleForm.macro, proto: ruleForm.proto, source: ruleForm.source, dest: ruleForm.dest, dport: ruleForm.dport, sport: ruleForm.sport, comment: ruleForm.comment }, mode === "edit");
 
       const path = mode === "create"
         ? `/api/proxmox/cluster/firewall/groups/${encodeURIComponent(selectedGroup.group)}`
@@ -1112,7 +1078,7 @@ export default function FirewallPage() {
       const params = new URLSearchParams();
       if (mode === "create") params.set("name", name);
       params.set("cidr", cidr);
-      if (aliasForm.comment.trim()) params.set("comment", aliasForm.comment.trim());
+      params.set("comment", aliasForm.comment.trim());
 
       const targetName = mode === "create" ? name : selectedAlias?.name ?? "";
       const path = mode === "create"

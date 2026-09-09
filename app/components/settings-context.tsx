@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { applyMode, Mode, applyDensity, Density } from "@cloudscape-design/global-styles";
 import type { Language } from "@/app/lib/translations";
 
@@ -47,20 +47,58 @@ export function useSettings() {
 
 const STORAGE_KEY = "pve-settings";
 
+export function parseSettings(raw: string | null): Settings {
+  try {
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return DEFAULT_SETTINGS;
+    const out = { ...DEFAULT_SETTINGS };
+    for (const key of ["theme", "language", "tableDensity", "dateFormat"] as const) {
+      const allowed = { theme: ["light", "dark", "system"], language: ["en", "ko"], tableDensity: ["comfortable", "compact"], dateFormat: ["relative", "absolute", "iso"] };
+      if (allowed[key].includes(parsed[key])) Object.assign(out, { [key]: parsed[key] });
+    }
+    for (const key of ["refreshInterval", "pageSize"] as const) {
+      const allowed = key === "refreshInterval" ? [0, 5, 10, 15, 30, 60, 120, 300] : [10, 20, 50, 100];
+      if (allowed.includes(parsed[key])) out[key] = parsed[key];
+    }
+    for (const key of ["confirmPowerActions", "showVmTags"] as const) if (typeof parsed[key] === "boolean") out[key] = parsed[key];
+    return out;
+  } catch { return DEFAULT_SETTINGS; }
+}
+
+let previousRaw: string | null | undefined;
+let snapshot = DEFAULT_SETTINGS;
+let volatileSettings: Settings | null = null;
 function loadSettings(): Settings {
   if (typeof window === "undefined") return DEFAULT_SETTINGS;
+  if (volatileSettings) return volatileSettings;
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+    if (saved !== previousRaw) { previousRaw = saved; snapshot = parseSettings(saved); }
+    return snapshot;
   } catch {}
-  return DEFAULT_SETTINGS;
+  return snapshot;
 }
 
 function saveSettings(settings: Settings) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-  } catch {}
+    volatileSettings = null;
+  } catch { volatileSettings = settings; }
+  snapshot = settings;
+  previousRaw = JSON.stringify(settings);
+  window.dispatchEvent(new Event("pve-settings-change"));
 }
+
+function subscribeSettings(callback: () => void) {
+  window.addEventListener("pve-settings-change", callback);
+  const storage = (event: StorageEvent) => {
+    if (event.key && event.key !== STORAGE_KEY) return;
+    volatileSettings = null; previousRaw = undefined; callback();
+  };
+  window.addEventListener("storage", storage);
+  return () => { window.removeEventListener("pve-settings-change", callback); window.removeEventListener("storage", storage); };
+}
+const getServerSettings = () => DEFAULT_SETTINGS;
 
 function applyTheme(theme: ThemeMode) {
   if (theme === "system") {
@@ -76,45 +114,23 @@ function applyTableDensity(density: TableDensity) {
 }
 
 export function SettingsProvider({ children }: { children: ReactNode }) {
-  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [initialized, setInitialized] = useState(false);
+  const settings = useSyncExternalStore(subscribeSettings, loadSettings, getServerSettings);
 
   useEffect(() => {
-    const loaded = loadSettings();
-    setSettings(loaded);
-    applyTheme(loaded.theme);
-    applyTableDensity(loaded.tableDensity);
-    setInitialized(true);
-  }, []);
-
-  useEffect(() => {
-    if (!initialized) return;
+    applyTheme(settings.theme);
+    applyTableDensity(settings.tableDensity);
+    document.documentElement.lang = settings.language;
     if (settings.theme !== "system") return;
-
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     const handler = () => applyTheme("system");
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
-  }, [initialized, settings.theme]);
+  }, [settings.theme, settings.tableDensity, settings.language]);
 
   const update = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
-    setSettings((prev) => {
-      const next = { ...prev, [key]: value };
-      saveSettings(next);
-
-      if (key === "theme") applyTheme(value as ThemeMode);
-      if (key === "tableDensity") applyTableDensity(value as TableDensity);
-
-      return next;
-    });
+    saveSettings(parseSettings(JSON.stringify({ ...loadSettings(), [key]: value })));
   }, []);
-
-  const reset = useCallback(() => {
-    setSettings(DEFAULT_SETTINGS);
-    saveSettings(DEFAULT_SETTINGS);
-    applyTheme(DEFAULT_SETTINGS.theme);
-    applyTableDensity(DEFAULT_SETTINGS.tableDensity);
-  }, []);
+  const reset = useCallback(() => saveSettings(DEFAULT_SETTINGS), []);
 
   return (
     <SettingsContext.Provider value={{ ...settings, update, reset }}>

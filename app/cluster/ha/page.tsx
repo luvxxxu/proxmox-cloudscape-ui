@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -22,6 +24,8 @@ import Tabs from "@cloudscape-design/components/tabs";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import Textarea from "@cloudscape-design/components/textarea";
 import { useTranslation } from "@/app/lib/use-translation";
+import { isIntegerInRange } from "@/app/lib/resource-api";
+import Link from "@/app/components/app-link";
 
 interface HaResource {
   sid: string;
@@ -31,12 +35,12 @@ interface HaResource {
   node?: string;
   max_relocate?: number;
   max_restart?: number;
-  rule?: string;
+  group?: string;
   comment?: string;
 }
 
-interface HaRule {
-  rule: string;
+interface HaGroup {
+  group: string;
   nodes?: string;
   restricted?: number | boolean;
   nofailback?: number | boolean;
@@ -55,13 +59,13 @@ interface ResourceFormState {
   sid: string;
   maxRestart: string;
   maxRelocate: string;
-  rule: string;
+  group: string;
   state: string;
   comment: string;
 }
 
-interface RuleFormState {
-  rule: string;
+interface GroupFormState {
+  group: string;
   nodes: string;
   restricted: boolean;
   nofailback: boolean;
@@ -81,19 +85,19 @@ const DEFAULT_RESOURCE_PREFERENCES: Preferences = {
     { id: "node", visible: true },
     { id: "maxRelocate", visible: true },
     { id: "maxRestart", visible: true },
-    { id: "rule", visible: true },
+    { id: "group", visible: true },
     { id: "comment", visible: true },
     { id: "actions", visible: true },
   ],
 };
 
-const DEFAULT_RULE_PREFERENCES: Preferences = {
+const DEFAULT_GROUP_PREFERENCES: Preferences = {
   pageSize: 20,
   wrapLines: false,
   stripedRows: true,
   contentDensity: "comfortable",
   contentDisplay: [
-    { id: "rule", visible: true },
+    { id: "group", visible: true },
     { id: "nodes", visible: true },
     { id: "restricted", visible: true },
     { id: "nofailback", visible: true },
@@ -106,13 +110,13 @@ const EMPTY_RESOURCE_FORM: ResourceFormState = {
   sid: "",
   maxRestart: "1",
   maxRelocate: "1",
-  rule: "",
+  group: "",
   state: "started",
   comment: "",
 };
 
-const EMPTY_RULE_FORM: RuleFormState = {
-  rule: "",
+const EMPTY_GROUP_FORM: GroupFormState = {
+  group: "",
   nodes: "",
   restricted: false,
   nofailback: false,
@@ -126,22 +130,7 @@ function interpolate(template: string, values: Record<string, string | number>) 
   );
 }
 
-function getMessage(responseData: unknown, fallback: string) {
-  if (typeof responseData === "string" && responseData.trim()) {
-    return responseData;
-  }
 
-  if (
-    typeof responseData === "object"
-    && responseData !== null
-    && "message" in responseData
-    && typeof responseData.message === "string"
-  ) {
-    return responseData.message;
-  }
-
-  return fallback;
-}
 
 function isEnabled(value?: number | boolean) {
   return value === 1 || value === true;
@@ -152,19 +141,19 @@ function buildResourceForm(resource: HaResource): ResourceFormState {
     sid: resource.sid,
     maxRestart: String(resource.max_restart ?? 1),
     maxRelocate: String(resource.max_relocate ?? 1),
-    rule: resource.rule ?? "",
+    group: resource.group ?? "",
     state: resource.state ?? "started",
     comment: resource.comment ?? "",
   };
 }
 
-function buildRuleForm(haRule: HaRule): RuleFormState {
+function buildGroupForm(haGroup: HaGroup): GroupFormState {
   return {
-    rule: haRule.rule,
-    nodes: haRule.nodes ?? "",
-    restricted: isEnabled(haRule.restricted),
-    nofailback: isEnabled(haRule.nofailback),
-    comment: haRule.comment ?? "",
+    group: haGroup.group,
+    nodes: haGroup.nodes ?? "",
+    restricted: isEnabled(haGroup.restricted),
+    nofailback: isEnabled(haGroup.nofailback),
+    comment: haGroup.comment ?? "",
   };
 }
 
@@ -195,38 +184,27 @@ function updatePreferences(
   }));
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T; message?: string } | null;
-
-  if (!response.ok) {
-    throw new Error(getMessage(json?.data ?? json?.message, interpolate(t("cluster.common.requestFailed"), { status: response.status })));
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function ClusterHaPage() {
   const { t } = useTranslation();
   const [activeTabId, setActiveTabId] = useState("resources");
   const [resources, setResources] = useState<HaResource[]>([]);
-  const [groups, setGroups] = useState<HaRule[]>([]);
+  const [groups, setGroups] = useState<HaGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [flashItems, setFlashItems] = useState<FlashbarProps.MessageDefinition[]>([]);
   const [resourcePreferences, setResourcePreferences] = useState<Preferences>(DEFAULT_RESOURCE_PREFERENCES);
-  const [groupPreferences, setGroupPreferences] = useState<Preferences>(DEFAULT_RULE_PREFERENCES);
+  const [groupPreferences, setGroupPreferences] = useState<Preferences>(DEFAULT_GROUP_PREFERENCES);
 
   const [resourceSubmitting, setResourceSubmitting] = useState(false);
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [selectedResource, setSelectedResource] = useState<HaResource | null>(null);
-  const [selectedGroup, setSelectedGroup] = useState<HaRule | null>(null);
+  const [selectedGroup, setSelectedGroup] = useState<HaGroup | null>(null);
   const [resourceForm, setResourceForm] = useState<ResourceFormState>(EMPTY_RESOURCE_FORM);
-  const [groupForm, setGroupForm] = useState<RuleFormState>(EMPTY_RULE_FORM);
+  const [groupForm, setGroupForm] = useState<GroupFormState>(EMPTY_GROUP_FORM);
 
   const [createResourceVisible, setCreateResourceVisible] = useState(false);
   const [editResourceVisible, setEditResourceVisible] = useState(false);
@@ -246,12 +224,17 @@ export default function ClusterHaPage() {
   const loadData = useCallback(async () => {
     try {
       setLoading(true);
-      const [nextResources, nextGroups] = await Promise.all([
+      const [nextResources, nextGroups, liveStatus] = await Promise.all([
         fetchProxmox<HaResource[]>("/api/proxmox/cluster/ha/resources", t),
-        fetchProxmox<HaRule[]>("/api/proxmox/cluster/ha/rules", t),
+        fetchProxmox<HaGroup[]>("/api/proxmox/cluster/ha/groups", t),
+        fetchProxmox<Array<Partial<HaResource> & { type: string }>>("/api/proxmox/cluster/ha/status/current", t),
       ]);
-      setResources((nextResources ?? []).sort((a, b) => a.sid.localeCompare(b.sid)));
-      setGroups((nextGroups ?? []).sort((a, b) => a.rule.localeCompare(b.rule)));
+      const liveBySid = new Map((liveStatus ?? []).filter((entry) => entry.type === "service" && entry.sid).map((entry) => [entry.sid, entry]));
+      setResources((nextResources ?? []).map((resource) => {
+        const live = liveBySid.get(resource.sid);
+        return { ...resource, status: live?.state ?? live?.status, node: live?.node, request_state: live?.request_state };
+      }).sort((a, b) => a.sid.localeCompare(b.sid)));
+      setGroups((nextGroups ?? []).sort((a, b) => a.group.localeCompare(b.group)));
       setError(null);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : t("cluster.ha.failedToLoad"));
@@ -260,11 +243,14 @@ export default function ClusterHaPage() {
     }
   }, [t]);
 
+  useResourceTaskRefresh(loadData);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadData();
   }, [loadData]);
 
-  const groupOptions = useMemo<SelectProps.Option[]>(() => groups.map((group) => ({ label: group.rule, value: group.rule })), [groups]);
+  const groupOptions = useMemo<SelectProps.Option[]>(() => [{ label: t("cluster.common.none"), value: "" }, ...groups.map((group) => ({ label: group.group, value: group.group }))], [groups, t]);
 
   const stateOptions = useMemo<SelectProps.Option[]>(
     () => [
@@ -294,10 +280,11 @@ export default function ClusterHaPage() {
   const submitResource = useCallback(async (mode: "create" | "edit") => {
     try {
       const sid = resourceForm.sid.trim();
-      if (!sid) {
+      if (!/^(?:vm|ct):[1-9]\d{2,8}$/.test(sid)) {
         throw new Error(t("cluster.ha.sidRequired"));
       }
 
+      if (!isIntegerInRange(resourceForm.maxRestart, 0) || !isIntegerInRange(resourceForm.maxRelocate, 0)) throw new Error(t("cluster.ha.retryCountInvalid"));
       setResourceSubmitting(true);
 
       const params = new URLSearchParams();
@@ -306,13 +293,15 @@ export default function ClusterHaPage() {
       params.set("max_relocate", resourceForm.maxRelocate.trim() || "1");
       params.set("state", resourceForm.state || "started");
 
-      if (resourceForm.rule.trim()) {
-        params.set("group", resourceForm.rule.trim());
+      if (resourceForm.group.trim()) {
+        params.set("group", resourceForm.group.trim());
       }
 
-      if (resourceForm.comment.trim()) {
-        params.set("comment", resourceForm.comment.trim());
-      }
+      const deleteFields: string[] = [];
+      if (resourceForm.comment.trim()) params.set("comment", resourceForm.comment.trim());
+      else if (mode === "edit") deleteFields.push("comment");
+      if (!resourceForm.group.trim() && mode === "edit") deleteFields.push("group");
+      if (deleteFields.length) params.set("delete", deleteFields.join(","));
 
       const path = mode === "create"
         ? "/api/proxmox/cluster/ha/resources"
@@ -365,9 +354,9 @@ export default function ClusterHaPage() {
 
   const submitGroup = useCallback(async (mode: "create" | "edit") => {
     try {
-      const rule = groupForm.rule.trim();
+      const group = groupForm.group.trim();
       const nodes = groupForm.nodes.trim();
-      if (!rule) {
+      if (!group) {
         throw new Error(t("cluster.ha.groupRequired"));
       }
       if (!nodes) {
@@ -377,17 +366,16 @@ export default function ClusterHaPage() {
       setGroupSubmitting(true);
 
       const params = new URLSearchParams();
-      params.set("group", rule);
+      params.set("group", group);
       params.set("nodes", nodes);
       params.set("restricted", groupForm.restricted ? "1" : "0");
       params.set("nofailback", groupForm.nofailback ? "1" : "0");
-      if (groupForm.comment.trim()) {
-        params.set("comment", groupForm.comment.trim());
-      }
+      if (groupForm.comment.trim()) params.set("comment", groupForm.comment.trim());
+      else if (mode === "edit") params.set("delete", "comment");
 
       const path = mode === "create"
-        ? "/api/proxmox/cluster/ha/rules"
-        : `/api/proxmox/cluster/ha/rules/${encodeURIComponent(selectedGroup?.rule ?? rule)}`;
+        ? "/api/proxmox/cluster/ha/groups"
+        : `/api/proxmox/cluster/ha/groups/${encodeURIComponent(selectedGroup?.group ?? group)}`;
 
       await fetchProxmox<string>(path, t, {
         method: mode === "create" ? "POST" : "PUT",
@@ -421,7 +409,7 @@ export default function ClusterHaPage() {
 
     try {
       setGroupSubmitting(true);
-      await fetchProxmox<string>(`/api/proxmox/cluster/ha/rules/${encodeURIComponent(selectedGroup.rule)}`, t, {
+      await fetchProxmox<string>(`/api/proxmox/cluster/ha/groups/${encodeURIComponent(selectedGroup.group)}`, t, {
         method: "DELETE",
       });
       setDeleteGroupVisible(false);
@@ -442,7 +430,7 @@ export default function ClusterHaPage() {
     { id: "node", header: t("cluster.ha.node"), cell: ({ node }) => node ?? t("cluster.common.none"), sortingField: "node", minWidth: 140 },
     { id: "maxRelocate", header: t("cluster.ha.maxRelocate"), cell: ({ max_relocate }) => String(max_relocate ?? 1), sortingComparator: (a, b) => (a.max_relocate ?? 0) - (b.max_relocate ?? 0), minWidth: 140 },
     { id: "maxRestart", header: t("cluster.ha.maxRestart"), cell: ({ max_restart }) => String(max_restart ?? 1), sortingComparator: (a, b) => (a.max_restart ?? 0) - (b.max_restart ?? 0), minWidth: 140 },
-    { id: "rule", header: t("cluster.ha.rule"), cell: ({ rule }) => rule ?? t("cluster.common.none"), sortingField: "rule", minWidth: 140 },
+    { id: "group", header: t("cluster.ha.group"), cell: ({ group }) => group ?? t("cluster.common.none"), sortingField: "group", minWidth: 140 },
     { id: "comment", header: t("cluster.ha.comment"), cell: ({ comment }) => comment ?? t("cluster.common.none"), minWidth: 220 },
     {
       id: "actions",
@@ -457,8 +445,8 @@ export default function ClusterHaPage() {
     },
   ], [resourceStatusType, t]);
 
-  const groupColumns = useMemo<TableProps<HaRule>["columnDefinitions"]>(() => [
-    { id: "rule", header: t("cluster.ha.rule"), cell: ({ rule }) => rule, sortingField: "rule", isRowHeader: true, minWidth: 160 },
+  const groupColumns = useMemo<TableProps<HaGroup>["columnDefinitions"]>(() => [
+    { id: "group", header: t("cluster.ha.group"), cell: ({ group }) => group, sortingField: "group", isRowHeader: true, minWidth: 160 },
     { id: "nodes", header: t("cluster.ha.nodes"), cell: ({ nodes }) => nodes ?? t("cluster.common.none"), minWidth: 220 },
     { id: "restricted", header: t("cluster.ha.restricted"), cell: ({ restricted }) => isEnabled(restricted) ? t("common.yes") : t("common.no"), minWidth: 120 },
     { id: "nofailback", header: t("cluster.ha.noFailback"), cell: ({ nofailback }) => isEnabled(nofailback) ? t("common.yes") : t("common.no"), minWidth: 140 },
@@ -468,7 +456,7 @@ export default function ClusterHaPage() {
       header: t("common.actions"),
       cell: (group) => (
         <SpaceBetween direction="horizontal" size="xs">
-          <Button variant="inline-link" onClick={() => { setSelectedGroup(group); setGroupForm(buildRuleForm(group)); setEditGroupVisible(true); }}>{t("common.edit")}</Button>
+          <Button variant="inline-link" onClick={() => { setSelectedGroup(group); setGroupForm(buildGroupForm(group)); setEditGroupVisible(true); }}>{t("common.edit")}</Button>
           <Button variant="inline-link" onClick={() => { setSelectedGroup(group); setDeleteGroupVisible(true); }}>{t("common.delete")}</Button>
         </SpaceBetween>
       ),
@@ -486,9 +474,10 @@ export default function ClusterHaPage() {
         if (!query) {
           return true;
         }
-        return [item.sid, item.state ?? "", item.status ?? "", item.request_state ?? "", item.node ?? "", String(item.max_relocate ?? ""), String(item.max_restart ?? ""), item.rule ?? "", item.comment ?? ""].some((value) => value.toLowerCase().includes(query));
+        return [item.sid, item.state ?? "", item.status ?? "", item.request_state ?? "", item.node ?? "", String(item.max_relocate ?? ""), String(item.max_restart ?? ""), item.group ?? "", item.comment ?? ""].some((value) => value.toLowerCase().includes(query));
       },
       empty: resourceEmptyState,
+      // eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions.
       noMatch: renderCenteredState(t("common.noMatches"), t("cluster.ha.noResourcesMatch"), <Button onClick={() => resourceActions.setFiltering("")}>{t("common.clearFilter")}</Button>),
     },
     sorting: { defaultState: { sortingColumn: resourceColumns[0] } },
@@ -502,9 +491,10 @@ export default function ClusterHaPage() {
         if (!query) {
           return true;
         }
-        return [item.rule, item.nodes ?? "", item.comment ?? "", isEnabled(item.restricted) ? t("common.yes") : t("common.no"), isEnabled(item.nofailback) ? t("common.yes") : t("common.no")].some((value) => value.toLowerCase().includes(query));
+        return [item.group, item.nodes ?? "", item.comment ?? "", isEnabled(item.restricted) ? t("common.yes") : t("common.no"), isEnabled(item.nofailback) ? t("common.yes") : t("common.no")].some((value) => value.toLowerCase().includes(query));
       },
       empty: groupEmptyState,
+      // eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions.
       noMatch: renderCenteredState(t("common.noMatches"), t("cluster.ha.noGroupsMatch"), <Button onClick={() => groupActions.setFiltering("")}>{t("common.clearFilter")}</Button>),
     },
     sorting: { defaultState: { sortingColumn: groupColumns[0] } },
@@ -530,6 +520,7 @@ export default function ClusterHaPage() {
         </Alert>
       ) : null}
 
+      <Alert type="info">{t("cluster.ha.legacyGroupsNotice")} <Link href="/api-explorer">{t("cluster.ha.affinityRulesLink")}</Link></Alert>
       <Tabs
         activeTabId={activeTabId}
         onChange={({ detail }) => setActiveTabId(detail.activeTabId)}
@@ -591,7 +582,7 @@ export default function ClusterHaPage() {
                         { id: "node", label: t("cluster.ha.node") },
                         { id: "maxRelocate", label: t("cluster.ha.maxRelocate") },
                         { id: "maxRestart", label: t("cluster.ha.maxRestart") },
-                        { id: "rule", label: t("cluster.ha.rule") },
+                        { id: "group", label: t("cluster.ha.group") },
                         { id: "comment", label: t("cluster.ha.comment") },
                         { id: "actions", label: t("common.actions") },
                       ],
@@ -613,7 +604,7 @@ export default function ClusterHaPage() {
                 stickyHeader
                 resizableColumns
                 enableKeyboardNavigation
-                trackBy="rule"
+                trackBy="group"
                 loading={loading}
                 loadingText={t("cluster.ha.loadingGroups")}
                 empty={groupFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("cluster.ha.noGroupsMatch"), <Button onClick={() => groupActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : groupEmptyState}
@@ -627,7 +618,7 @@ export default function ClusterHaPage() {
                     description={t("cluster.ha.groupsDescription")}
                     actions={
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Button variant="primary" onClick={() => { setSelectedGroup(null); setGroupForm(EMPTY_RULE_FORM); setCreateGroupVisible(true); }}>{t("cluster.ha.createGroup")}</Button>
+                        <Button variant="primary" onClick={() => { setSelectedGroup(null); setGroupForm(EMPTY_GROUP_FORM); setCreateGroupVisible(true); }}>{t("cluster.ha.createGroup")}</Button>
                         <Button iconName="refresh" onClick={() => void loadData()}>{t("common.refresh")}</Button>
                       </SpaceBetween>
                     }
@@ -651,7 +642,7 @@ export default function ClusterHaPage() {
                     contentDisplayPreference={{
                       title: t("common.columnPreferences"),
                       options: [
-                        { id: "rule", label: t("cluster.ha.rule"), alwaysVisible: true },
+                        { id: "group", label: t("cluster.ha.group"), alwaysVisible: true },
                         { id: "nodes", label: t("cluster.ha.nodes") },
                         { id: "restricted", label: t("cluster.ha.restricted") },
                         { id: "nofailback", label: t("cluster.ha.noFailback") },
@@ -674,10 +665,11 @@ export default function ClusterHaPage() {
         footer={<Box float="right"><SpaceBetween direction="horizontal" size="xs"><Button onClick={() => setCreateResourceVisible(false)}>{t("common.cancel")}</Button><Button variant="primary" loading={resourceSubmitting} onClick={() => void submitResource("create")}>{t("common.create")}</Button></SpaceBetween></Box>}
       >
         <SpaceBetween size="m">
+          {error ? <Alert type="error">{error}</Alert> : null}
           <FormField label={t("cluster.ha.resourceSid")}><Input value={resourceForm.sid} placeholder={t("cluster.ha.resourceSidPlaceholder")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, sid: detail.value }))} /></FormField>
           <FormField label={t("cluster.ha.maxRestart")}><Input value={resourceForm.maxRestart} onChange={({ detail }) => setResourceForm((current) => ({ ...current, maxRestart: detail.value }))} /></FormField>
           <FormField label={t("cluster.ha.maxRelocate")}><Input value={resourceForm.maxRelocate} onChange={({ detail }) => setResourceForm((current) => ({ ...current, maxRelocate: detail.value }))} /></FormField>
-          <FormField label={t("cluster.ha.rule")}><Select selectedOption={groupOptions.find((option) => option.value === resourceForm.rule) ?? null} options={groupOptions} placeholder={t("cluster.ha.selectGroup")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, rule: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "" }))} /></FormField>
+          <FormField label={t("cluster.ha.group")}><Select selectedOption={groupOptions.find((option) => option.value === resourceForm.group) ?? null} options={groupOptions} placeholder={t("cluster.ha.selectGroup")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, group: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "" }))} /></FormField>
           <FormField label={t("cluster.ha.state")}><Select selectedOption={stateOptions.find((option) => option.value === resourceForm.state) ?? null} options={stateOptions} placeholder={t("cluster.ha.selectState")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, state: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "started" }))} /></FormField>
           <FormField label={t("cluster.ha.comment")}><Textarea value={resourceForm.comment} placeholder={t("cluster.ha.commentPlaceholder")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, comment: detail.value }))} /></FormField>
         </SpaceBetween>
@@ -690,10 +682,11 @@ export default function ClusterHaPage() {
         footer={<Box float="right"><SpaceBetween direction="horizontal" size="xs"><Button onClick={() => setEditResourceVisible(false)}>{t("common.cancel")}</Button><Button variant="primary" loading={resourceSubmitting} onClick={() => void submitResource("edit")}>{t("common.save")}</Button></SpaceBetween></Box>}
       >
         <SpaceBetween size="m">
+          {error ? <Alert type="error">{error}</Alert> : null}
           <FormField label={t("cluster.ha.resourceSid")}><Input value={resourceForm.sid} disabled /></FormField>
           <FormField label={t("cluster.ha.maxRestart")}><Input value={resourceForm.maxRestart} onChange={({ detail }) => setResourceForm((current) => ({ ...current, maxRestart: detail.value }))} /></FormField>
           <FormField label={t("cluster.ha.maxRelocate")}><Input value={resourceForm.maxRelocate} onChange={({ detail }) => setResourceForm((current) => ({ ...current, maxRelocate: detail.value }))} /></FormField>
-          <FormField label={t("cluster.ha.rule")}><Select selectedOption={groupOptions.find((option) => option.value === resourceForm.rule) ?? null} options={groupOptions} placeholder={t("cluster.ha.selectGroup")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, rule: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "" }))} /></FormField>
+          <FormField label={t("cluster.ha.group")}><Select selectedOption={groupOptions.find((option) => option.value === resourceForm.group) ?? null} options={groupOptions} placeholder={t("cluster.ha.selectGroup")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, group: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "" }))} /></FormField>
           <FormField label={t("cluster.ha.state")}><Select selectedOption={stateOptions.find((option) => option.value === resourceForm.state) ?? null} options={stateOptions} placeholder={t("cluster.ha.selectState")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, state: typeof detail.selectedOption.value === "string" ? detail.selectedOption.value : "started" }))} /></FormField>
           <FormField label={t("cluster.ha.comment")}><Textarea value={resourceForm.comment} placeholder={t("cluster.ha.commentPlaceholder")} onChange={({ detail }) => setResourceForm((current) => ({ ...current, comment: detail.value }))} /></FormField>
         </SpaceBetween>
@@ -715,7 +708,8 @@ export default function ClusterHaPage() {
         footer={<Box float="right"><SpaceBetween direction="horizontal" size="xs"><Button onClick={() => setCreateGroupVisible(false)}>{t("common.cancel")}</Button><Button variant="primary" loading={groupSubmitting} onClick={() => void submitGroup("create")}>{t("common.create")}</Button></SpaceBetween></Box>}
       >
         <SpaceBetween size="m">
-          <FormField label={t("cluster.ha.ruleName")}><Input value={groupForm.rule} placeholder={t("cluster.ha.ruleNamePlaceholder")} onChange={({ detail }) => setGroupForm((current: RuleFormState) => ({ ...current, rule: detail.value }))} /></FormField>
+          {error ? <Alert type="error">{error}</Alert> : null}
+          <FormField label={t("cluster.ha.groupName")}><Input value={groupForm.group} placeholder={t("cluster.ha.groupNamePlaceholder")} onChange={({ detail }) => setGroupForm((current: GroupFormState) => ({ ...current, group: detail.value }))} /></FormField>
           <FormField label={t("cluster.ha.nodes")} description={t("cluster.ha.nodesHelp")}><Input value={groupForm.nodes} placeholder={t("cluster.ha.nodesPlaceholder")} onChange={({ detail }) => setGroupForm((current) => ({ ...current, nodes: detail.value }))} /></FormField>
           <FormField label={t("cluster.ha.comment")}><Textarea value={groupForm.comment} placeholder={t("cluster.ha.commentPlaceholder")} onChange={({ detail }) => setGroupForm((current) => ({ ...current, comment: detail.value }))} /></FormField>
           <Checkbox checked={groupForm.restricted} onChange={({ detail }) => setGroupForm((current) => ({ ...current, restricted: detail.checked }))}>{t("cluster.ha.restrictedLabel")}</Checkbox>
@@ -730,7 +724,8 @@ export default function ClusterHaPage() {
         footer={<Box float="right"><SpaceBetween direction="horizontal" size="xs"><Button onClick={() => setEditGroupVisible(false)}>{t("common.cancel")}</Button><Button variant="primary" loading={groupSubmitting} onClick={() => void submitGroup("edit")}>{t("common.save")}</Button></SpaceBetween></Box>}
       >
         <SpaceBetween size="m">
-          <FormField label={t("cluster.ha.ruleName")}><Input value={groupForm.rule} disabled /></FormField>
+          {error ? <Alert type="error">{error}</Alert> : null}
+          <FormField label={t("cluster.ha.groupName")}><Input value={groupForm.group} disabled /></FormField>
           <FormField label={t("cluster.ha.nodes")} description={t("cluster.ha.nodesHelp")}><Input value={groupForm.nodes} placeholder={t("cluster.ha.nodesPlaceholder")} onChange={({ detail }) => setGroupForm((current) => ({ ...current, nodes: detail.value }))} /></FormField>
           <FormField label={t("cluster.ha.comment")}><Textarea value={groupForm.comment} placeholder={t("cluster.ha.commentPlaceholder")} onChange={({ detail }) => setGroupForm((current) => ({ ...current, comment: detail.value }))} /></FormField>
           <Checkbox checked={groupForm.restricted} onChange={({ detail }) => setGroupForm((current) => ({ ...current, restricted: detail.checked }))}>{t("cluster.ha.restrictedLabel")}</Checkbox>
@@ -744,7 +739,7 @@ export default function ClusterHaPage() {
         header={t("cluster.ha.deleteGroupModalTitle")}
         footer={<Box float="right"><SpaceBetween direction="horizontal" size="xs"><Button onClick={() => setDeleteGroupVisible(false)}>{t("common.cancel")}</Button><Button variant="primary" loading={groupSubmitting} onClick={() => void deleteGroup()}>{t("common.delete")}</Button></SpaceBetween></Box>}
       >
-        <Box>{selectedGroup ? interpolate(t("cluster.ha.deleteGroupConfirmation"), { rule: selectedGroup.rule }) : null}</Box>
+        <Box>{selectedGroup ? interpolate(t("cluster.ha.deleteGroupConfirmation"), { group: selectedGroup.group }) : null}</Box>
       </Modal>
     </SpaceBetween>
   );

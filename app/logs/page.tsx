@@ -1,6 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+import { syslogMessage } from "@/app/lib/resource-api";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -117,11 +120,7 @@ function formatTaskLog(lines: TaskLogLine[]) {
 }
 
 function getSyslogMessage(entry: SyslogEntry) {
-  return entry.msg ?? entry.message ?? "-";
-}
-
-function getSyslogTimestamp(entry: SyslogEntry) {
-  return formatDateTime(entry.t ?? entry.time);
+  return syslogMessage(entry);
 }
 
 function getSyslogLineNumber(entry: SyslogEntry, index: number, pageIndex: number) {
@@ -132,13 +131,8 @@ function getSyslogLineNumber(entry: SyslogEntry, index: number, pageIndex: numbe
   return (pageIndex - 1) * SYSLOG_PAGE_SIZE + index + 1;
 }
 
-async function fetchProxmox<T>(path: string): Promise<T> {
-  const response = await fetch(path, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
-  }
-  const json = (await response.json()) as { data?: T };
-  return json.data as T;
+async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function LogsPage() {
@@ -158,6 +152,7 @@ export default function LogsPage() {
   const [syslogError, setSyslogError] = useState<string | null>(null);
   const [syslogPageIndex, setSyslogPageIndex] = useState(1);
   const [syslogHasMore, setSyslogHasMore] = useState(false);
+  const syslogRequest = useRef<AbortController | null>(null);
 
   const loadNodesAndTasks = useCallback(async () => {
     try {
@@ -166,7 +161,7 @@ export default function LogsPage() {
       const nodeData = await fetchProxmox<NodeSummary[]>("/api/proxmox/nodes");
       const nextNodes = nodeData ?? [];
       const onlineNodes = nextNodes.filter(({ status }) => status === "online");
-      const taskGroups = await Promise.all(
+      const taskGroups = await Promise.allSettled(
         onlineNodes.map(async ({ node }) => {
           const nodeTasks = await fetchProxmox<Omit<TaskSummary, "node">[]>(
             `/api/proxmox/nodes/${encodeURIComponent(node)}/tasks?limit=100&start=0`,
@@ -187,7 +182,10 @@ export default function LogsPage() {
         }),
       );
 
-      const mergedTasks = taskGroups.flat().sort((a, b) => (b.starttime ?? 0) - (a.starttime ?? 0));
+      const mergedTasks = taskGroups.flatMap((result) => result.status === "fulfilled" ? result.value : [])
+        .sort((a, b) => (b.starttime ?? 0) - (a.starttime ?? 0));
+      const failures = taskGroups.flatMap((result, index) => result.status === "rejected"
+        ? [`${onlineNodes[index].node}: ${result.reason instanceof Error ? result.reason.message : t("logs.failedToLoadTasks")}`] : []);
 
       setNodes(nextNodes);
       setTasks(mergedTasks);
@@ -198,9 +196,9 @@ export default function LogsPage() {
         }
         return nextNodes[0]?.node ?? null;
       });
-      setTasksError(null);
+      setTasksError(failures.length ? failures.join("; ") : null);
     } catch (fetchError) {
-      setTasksError(t("logs.failedToLoadTasks"));
+      setTasksError(fetchError instanceof Error ? fetchError.message : t("logs.failedToLoadTasks"));
     } finally {
       setTasksLoading(false);
     }
@@ -232,33 +230,43 @@ export default function LogsPage() {
         ...current,
         [task.key]: {
           status: "error",
-          content: t("logs.logUnavailable"),
+          content: fetchError instanceof Error ? fetchError.message : t("logs.logUnavailable"),
         },
       }));
     }
   }, [t]);
 
   const loadSyslog = useCallback(async (node: string, pageIndex: number) => {
+    syslogRequest.current?.abort();
+    const controller = new AbortController();
+    syslogRequest.current = controller;
     try {
       setSyslogLoading(true);
 
       const start = (pageIndex - 1) * SYSLOG_PAGE_SIZE;
       const entries = await fetchProxmox<SyslogEntry[]>(
         `/api/proxmox/nodes/${encodeURIComponent(node)}/syslog?limit=${SYSLOG_PAGE_SIZE}&start=${start}`,
+        { signal: controller.signal },
       );
 
+      if (controller.signal.aborted) return;
       const nextEntries = entries ?? [];
       setSyslogEntries(nextEntries);
       setSyslogHasMore(nextEntries.length === SYSLOG_PAGE_SIZE);
       setSyslogError(null);
     } catch (fetchError) {
+      if (controller.signal.aborted) return;
       setSyslogEntries([]);
       setSyslogHasMore(false);
-      setSyslogError(t("logs.failedToLoadSyslog"));
+      setSyslogError(fetchError instanceof Error ? fetchError.message : t("logs.failedToLoadSyslog"));
     } finally {
-      setSyslogLoading(false);
+      if (!controller.signal.aborted) setSyslogLoading(false);
     }
   }, [t]);
+
+  useEffect(() => () => syslogRequest.current?.abort(), []);
+
+  useResourceTaskRefresh(loadNodesAndTasks);
 
   useEffect(() => {
     void loadNodesAndTasks();
@@ -266,6 +274,7 @@ export default function LogsPage() {
 
   useEffect(() => {
     if (!selectedNode) {
+      syslogRequest.current?.abort();
       setSyslogEntries([]);
       setSyslogError(null);
       setSyslogHasMore(false);
@@ -460,19 +469,13 @@ export default function LogsPage() {
         minWidth: 140,
       },
       {
-        id: "timestamp",
-        header: t("logs.timestamp"),
-        cell: (item) => getSyslogTimestamp(item),
-        minWidth: 220,
-      },
-      {
         id: "message",
         header: t("logs.message"),
         cell: (item) => getSyslogMessage(item),
         minWidth: 500,
       },
     ],
-    [syslogPageIndex, t],
+    [t],
   );
 
   const syslogEmptyState = (
@@ -499,7 +502,7 @@ export default function LogsPage() {
           return true;
         }
 
-        return [String(item.lineNumber), getSyslogTimestamp(item), getSyslogMessage(item)].some((value) =>
+        return [String(item.lineNumber), getSyslogMessage(item)].some((value) =>
           value.toLowerCase().includes(query),
         );
       },

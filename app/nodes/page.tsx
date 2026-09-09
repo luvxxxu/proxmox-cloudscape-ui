@@ -1,5 +1,9 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
+import { formatResourceBytes as formatBytes, parseClusterJoinInfo, buildClusterJoinParameters } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -24,13 +28,13 @@ import { useTranslation } from "@/app/lib/use-translation";
 interface PveNode {
   node: string;
   status: "online" | "offline" | "unknown";
-  cpu: number;
-  maxcpu: number;
-  mem: number;
-  maxmem: number;
-  disk: number;
-  maxdisk: number;
-  uptime: number;
+  cpu?: number;
+  maxcpu?: number;
+  mem?: number;
+  maxmem?: number;
+  disk?: number;
+  maxdisk?: number;
+  uptime?: number;
 }
 
 interface Preferences {
@@ -46,6 +50,7 @@ interface JoinClusterForm {
   hostname: string;
   password: string;
   fingerprint: string;
+  links: Record<string, string>;
 }
 
 interface JoinClusterErrors {
@@ -71,15 +76,10 @@ const DEFAULT_PREFERENCES: Preferences = {
   ],
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
 
-function formatUptime(seconds: number): string {
+
+function formatUptime(seconds?: number): string {
+  if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return "-";
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   if (days > 0) {
@@ -93,18 +93,7 @@ function getStatusType(status: PveNode["status"]) {
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T | string } | null;
-
-  if (!response.ok) {
-    throw new Error(typeof json?.data === "string" ? json.data : `Request failed with status ${response.status}`);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path, init);
 }
 
 const DEFAULT_JOIN_CLUSTER_FORM: JoinClusterForm = {
@@ -112,6 +101,7 @@ const DEFAULT_JOIN_CLUSTER_FORM: JoinClusterForm = {
   hostname: "",
   password: "",
   fingerprint: "",
+  links: {},
 };
 
 export default function NodesPage() {
@@ -125,6 +115,7 @@ export default function NodesPage() {
   const [joinClusterModalVisible, setJoinClusterModalVisible] = useState(false);
   const [joinClusterForm, setJoinClusterForm] = useState<JoinClusterForm>(DEFAULT_JOIN_CLUSTER_FORM);
   const [joinClusterErrors, setJoinClusterErrors] = useState<JoinClusterErrors>({});
+  const [joinRequestError, setJoinRequestError] = useState<string | null>(null);
   const [joinLoading, setJoinLoading] = useState(false);
   const [wolLoadingNodes, setWolLoadingNodes] = useState<string[]>([]);
 
@@ -132,15 +123,10 @@ export default function NodesPage() {
     setFlashbarItems((current) => [...current.filter((entry) => entry.id !== item.id), item]);
   }, []);
 
-  const parseJoinInfo = useCallback((value: string) => {
-    const hostnameMatch = value.match(/(?:--link0\s+)?address=([^\s,]+)/i);
-    const fingerprintMatch = value.match(/(?:--fingerprint\s+|fingerprint=)([^\s,]+)/i);
-
-    return {
-      hostname: hostnameMatch?.[1] ?? "",
-      fingerprint: fingerprintMatch?.[1] ?? "",
-    };
-  }, []);
+  const parsedJoinInfo = useMemo(() => {
+    try { return parseClusterJoinInfo(joinClusterForm.joinInfo); }
+    catch { return null; }
+  }, [joinClusterForm.joinInfo]);
 
   const loadNodes = useCallback(async () => {
     try {
@@ -158,28 +144,21 @@ export default function NodesPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   const offlineSelectedItems = useMemo(() => selectedItems.filter((item) => item.status === "offline"), [selectedItems]);
   const canWakeSelected = selectedItems.length > 0 && offlineSelectedItems.length === selectedItems.length && wolLoadingNodes.length === 0 && !joinLoading;
 
   const handleJoinInfoChange = useCallback((value: string) => {
-    const parsed = parseJoinInfo(value);
-
-    setJoinClusterForm((current) => ({
-      ...current,
-      joinInfo: value,
-      hostname: parsed.hostname || current.hostname,
-      fingerprint: parsed.fingerprint || current.fingerprint,
-    }));
-
-    setJoinClusterErrors((current) => ({
-      ...current,
-      joinInfo: undefined,
-      hostname: parsed.hostname ? undefined : current.hostname,
-      fingerprint: parsed.fingerprint ? undefined : current.fingerprint,
-    }));
-  }, [parseJoinInfo]);
+    try {
+      const parsed = parseClusterJoinInfo(value);
+      setJoinClusterForm((current) => ({ ...current, joinInfo: value, hostname: parsed?.hostname ?? current.hostname, fingerprint: parsed?.fingerprint ?? current.fingerprint, links: {} }));
+      setJoinClusterErrors({});
+    } catch {
+      setJoinClusterForm((current) => ({ ...current, joinInfo: value }));
+      setJoinClusterErrors((current) => ({ ...current, joinInfo: t("nodes.joinInformationInvalid") }));
+    }
+  }, [t]);
 
   const closeJoinClusterModal = useCallback(() => {
     setJoinClusterModalVisible(false);
@@ -190,6 +169,7 @@ export default function NodesPage() {
   const openJoinClusterModal = useCallback(() => {
     setJoinClusterForm(DEFAULT_JOIN_CLUSTER_FORM);
     setJoinClusterErrors({});
+    setJoinRequestError(null);
     setJoinClusterModalVisible(true);
   }, []);
 
@@ -197,11 +177,11 @@ export default function NodesPage() {
     const nextErrors: JoinClusterErrors = {};
     const joinInfo = joinClusterForm.joinInfo.trim();
     const hostname = joinClusterForm.hostname.trim();
-    const password = joinClusterForm.password.trim();
+    const password = joinClusterForm.password;
     const fingerprint = joinClusterForm.fingerprint.trim();
 
-    if (!joinInfo) {
-      nextErrors.joinInfo = t("nodes.clusterJoinLinkRequired");
+    if (joinInfo && !parsedJoinInfo) {
+      nextErrors.joinInfo = t("nodes.joinInformationInvalid");
     }
     if (!hostname) {
       nextErrors.hostname = t("nodes.peerHostnameRequired");
@@ -220,14 +200,10 @@ export default function NodesPage() {
 
     try {
       setJoinLoading(true);
+      setJoinRequestError(null);
       setJoinClusterErrors({});
 
-      const body = new URLSearchParams({
-        hostname,
-        password,
-        fingerprint,
-        link0: joinInfo,
-      });
+      const body = buildClusterJoinParameters(joinClusterForm, parsedJoinInfo);
 
       await fetchProxmox("/api/proxmox/cluster/config/join", {
         method: "POST",
@@ -248,6 +224,7 @@ export default function NodesPage() {
       await loadNodes();
     } catch (joinError) {
       const message = joinError instanceof Error ? joinError.message : t("nodes.joinFailed");
+      setJoinRequestError(message);
       pushFlash({
         type: "error",
         content: message || t("nodes.joinFailed"),
@@ -257,7 +234,7 @@ export default function NodesPage() {
     } finally {
       setJoinLoading(false);
     }
-  }, [closeJoinClusterModal, joinClusterForm, loadNodes, pushFlash, t]);
+  }, [closeJoinClusterModal, joinClusterForm, loadNodes, parsedJoinInfo, pushFlash, t]);
 
   const runWakeOnLan = useCallback(async (targetNodes: PveNode[]) => {
     if (targetNodes.length === 0) {
@@ -272,7 +249,7 @@ export default function NodesPage() {
     try {
       setWolLoadingNodes((current) => [...new Set([...current, ...offlineNodes.map((item) => item.node)])]);
 
-      await Promise.all(
+      const results = await Promise.allSettled(
         offlineNodes.map((item) =>
           fetchProxmox(`/api/proxmox/nodes/${item.node}/wakeonlan`, {
             method: "POST",
@@ -284,11 +261,14 @@ export default function NodesPage() {
         ),
       );
 
-      pushFlash({
-        type: "success",
-        content: t("nodes.wolSuccess"),
-        dismissible: true,
-        id: "nodes-wol-success",
+      results.forEach((result, index) => {
+        const target = offlineNodes[index].node;
+        pushFlash({
+          type: result.status === "fulfilled" ? "success" : "error",
+          content: result.status === "fulfilled" ? t("nodes.wolSuccess").replace("{node}", target) : `${target}: ${result.reason instanceof Error ? result.reason.message : t("nodes.wolFailed")}`,
+          dismissible: true,
+          id: `nodes-wol-${target}`,
+        });
       });
 
       await loadNodes();
@@ -305,7 +285,10 @@ export default function NodesPage() {
     }
   }, [loadNodes, pushFlash, t]);
 
+  useResourceTaskRefresh(loadNodes);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadNodes();
   }, [loadNodes]);
 
@@ -329,29 +312,29 @@ export default function NodesPage() {
       {
         id: "cpu",
         header: t("common.cpuPercent"),
-        cell: ({ cpu }) => `${(cpu * 100).toFixed(1)}%`,
-        sortingComparator: (a, b) => a.cpu - b.cpu,
+        cell: ({ cpu }) => cpu !== undefined && Number.isFinite(cpu) ? `${(cpu * 100).toFixed(1)}%` : "-",
+        sortingComparator: (a, b) => (a.cpu ?? 0) - (b.cpu ?? 0),
         minWidth: 120,
       },
       {
         id: "memory",
         header: t("common.memory"),
         cell: ({ mem, maxmem }) => `${formatBytes(mem)} / ${formatBytes(maxmem)}`,
-        sortingComparator: (a, b) => a.mem - b.mem,
+        sortingComparator: (a, b) => (a.mem ?? 0) - (b.mem ?? 0),
         minWidth: 220,
       },
       {
         id: "disk",
         header: t("common.disk"),
         cell: ({ disk, maxdisk }) => `${formatBytes(disk)} / ${formatBytes(maxdisk)}`,
-        sortingComparator: (a, b) => a.disk - b.disk,
+        sortingComparator: (a, b) => (a.disk ?? 0) - (b.disk ?? 0),
         minWidth: 220,
       },
       {
         id: "uptime",
         header: t("common.uptime"),
         cell: ({ uptime }) => formatUptime(uptime),
-        sortingComparator: (a, b) => a.uptime - b.uptime,
+        sortingComparator: (a, b) => (a.uptime ?? 0) - (b.uptime ?? 0),
         minWidth: 140,
       },
       {
@@ -403,7 +386,7 @@ export default function NodesPage() {
         return [
           item.node,
           item.status,
-          `${(item.cpu * 100).toFixed(1)}%`,
+          item.cpu !== undefined && Number.isFinite(item.cpu) ? `${(item.cpu * 100).toFixed(1)}%` : "-",
           `${formatBytes(item.mem)} / ${formatBytes(item.maxmem)}`,
           `${formatBytes(item.disk)} / ${formatBytes(item.maxdisk)}`,
           formatUptime(item.uptime),
@@ -417,6 +400,7 @@ export default function NodesPage() {
             <Box variant="p" color="inherit">
               {t("nodes.noNodesMatch")}
             </Box>
+            {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
             <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
           </SpaceBetween>
         </Box>
@@ -449,7 +433,7 @@ export default function NodesPage() {
 
   return (
     <SpaceBetween size="m">
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry.id !== item.id))) }))} /> : null}
       {error ? (
         <Alert type="error" header={t("nodes.failedToLoad")}>
           {error}
@@ -457,13 +441,13 @@ export default function NodesPage() {
       ) : null}
       <Modal
         visible={joinClusterModalVisible}
-        onDismiss={closeJoinClusterModal}
+        onDismiss={() => { if (!joinLoading) closeJoinClusterModal(); }}
         header={t("nodes.joinClusterModalTitle")}
         closeAriaLabel={t("nodes.joinClusterModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween size="xs" direction="horizontal">
-              <Button variant="link" onClick={closeJoinClusterModal}>{t("common.cancel")}</Button>
+              <Button variant="link" disabled={joinLoading} onClick={closeJoinClusterModal}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={joinLoading} onClick={() => void submitJoinCluster()}>
                 {t("common.save")}
               </Button>
@@ -472,6 +456,7 @@ export default function NodesPage() {
         }
       >
         <SpaceBetween size="m">
+          {joinRequestError ? <Alert type="error">{joinRequestError}</Alert> : null}
           <Box color="text-body-secondary">{t("nodes.joinClusterDescription")}</Box>
           <FormField
             label={t("nodes.clusterJoinLink")}
@@ -483,6 +468,13 @@ export default function NodesPage() {
               onChange={({ detail }) => handleJoinInfoChange(detail.value)}
             />
           </FormField>
+          {(parsedJoinInfo?.links ?? [0]).map((number) => <FormField
+            key={number}
+            label={t("nodes.localClusterLink").replace("{number}", String(number))}
+            description={parsedJoinInfo?.requiredLinks.includes(number) ? t("nodes.localClusterLinkRequired") : t("nodes.localClusterLinkOptional")}
+          >
+            <Input value={joinClusterForm.links[String(number)] ?? ""} placeholder="192.168.1.2" onChange={({ detail }) => setJoinClusterForm((current) => ({ ...current, links: { ...current.links, [number]: detail.value } }))} />
+          </FormField>)}
           <FormField
             label={t("nodes.peerHostname")}
             errorText={joinClusterErrors.hostname}

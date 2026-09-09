@@ -1,6 +1,6 @@
 "use client";
 
-import { type Dispatch, type ReactNode, type SetStateAction, useCallback, useEffect, useMemo, useState } from "react";
+import { type Dispatch, type ReactNode, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -12,6 +12,7 @@ import Flashbar, { type FlashbarProps } from "@cloudscape-design/components/flas
 import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
 import Input from "@cloudscape-design/components/input";
+import Multiselect from "@cloudscape-design/components/multiselect";
 import Modal from "@cloudscape-design/components/modal";
 import Pagination from "@cloudscape-design/components/pagination";
 import Select, { type SelectProps } from "@cloudscape-design/components/select";
@@ -22,6 +23,10 @@ import Tabs from "@cloudscape-design/components/tabs";
 import Textarea from "@cloudscape-design/components/textarea";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import { useTranslation } from "@/app/lib/use-translation";
+
+import UserSecurity from "./user-security";
+import { AccessApiError, accessRequest } from "./access-api";
+import { accessList, parseExpireInput, formatExpireInput, isValidUserId, isValidAccessId, realmTfaType } from "./access-data";
 
 interface PveToken {
   tokenid?: string;
@@ -44,12 +49,7 @@ interface PveUser {
 interface PveGroupListItem {
   groupid: string;
   comment?: string;
-}
-
-interface PveGroupDetails {
-  comment?: string;
-  members?: string[] | string;
-  users?: string[] | string;
+  users?: string;
 }
 
 interface GroupRow {
@@ -105,6 +105,9 @@ interface PveRealm {
   user_attr?: string;
   port?: number;
   secure?: number | boolean;
+  mode?: "ldap" | "ldaps" | "ldap+starttls";
+  verify?: number | boolean;
+  digest?: string;
   bind_dn?: string;
   domain?: string;
   "issuer-url"?: string;
@@ -126,7 +129,11 @@ interface RealmFormState {
   baseDn: string;
   userAttribute: string;
   port: string;
-  ssl: boolean;
+  mode: "ldap" | "ldaps" | "ldap+starttls";
+  verify: boolean;
+  fallbackServer: string;
+  digest: string;
+  tfaConfig: string;
   bindDn: string;
   bindPassword: string;
   domain: string;
@@ -134,7 +141,7 @@ interface RealmFormState {
   clientId: string;
   clientKey: string;
   autocreate: boolean;
-  usernameClaim: "subject" | "username" | "email";
+  usernameClaim: string;
 }
 
 interface Preferences {
@@ -289,7 +296,11 @@ const EMPTY_REALM_FORM: RealmFormState = {
   baseDn: "",
   userAttribute: "uid",
   port: "",
-  ssl: false,
+  mode: "ldaps",
+  verify: true,
+  fallbackServer: "",
+  digest: "",
+  tfaConfig: "",
   bindDn: "",
   bindPassword: "",
   domain: "",
@@ -297,7 +308,7 @@ const EMPTY_REALM_FORM: RealmFormState = {
   clientId: "",
   clientKey: "",
   autocreate: false,
-  usernameClaim: "subject",
+  usernameClaim: "",
 };
 
 function interpolate(template: string, values: Record<string, string | number>) {
@@ -307,16 +318,7 @@ function interpolate(template: string, values: Record<string, string | number>) 
   );
 }
 
-function toList(value?: string[] | string): string[] {
-  if (Array.isArray(value)) {
-    return value.filter(Boolean);
-  }
-
-  return (value ?? "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
+const toList = accessList;
 
 function formatList(value?: string[] | string, emptyValue = "") {
   const items = toList(value);
@@ -328,8 +330,8 @@ function getRealm(user: PveUser, emptyValue = "") {
     return user.realm;
   }
 
-  const parts = user.userid.split("@");
-  return parts.length > 1 ? parts.slice(1).join("@") : emptyValue;
+  const separator = user.userid.lastIndexOf("@");
+  return separator >= 0 ? user.userid.slice(separator + 1) : emptyValue;
 }
 
 function isUserEnabled(user: PveUser) {
@@ -371,57 +373,8 @@ function getAclType(entry: PveAcl): "user" | "group" | "token" {
   return "user";
 }
 
-function parseExpireInput(value: string) {
-  if (!value.trim()) {
-    return { valid: true, epoch: "0" };
-  }
-
-  const timestamp = Date.parse(`${value}T00:00:00`);
-  if (Number.isNaN(timestamp)) {
-    return { valid: false, epoch: "0" };
-  }
-
-  return { valid: true, epoch: String(Math.floor(timestamp / 1000)) };
-}
-
-function formatExpireInput(expire?: number) {
-  if (!expire) {
-    return "";
-  }
-
-  return new Date(expire * 1000).toISOString().slice(0, 10);
-}
-
-function getMessage(responseData: unknown, fallback: string) {
-  if (typeof responseData === "string" && responseData.trim()) {
-    return responseData;
-  }
-
-  if (
-    typeof responseData === "object"
-    && responseData !== null
-    && "message" in responseData
-    && typeof responseData.message === "string"
-  ) {
-    return responseData.message;
-  }
-
-  return fallback;
-}
-
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T; message?: string } | null;
-
-  if (!response.ok) {
-    throw new Error(getMessage(json?.data ?? json?.message, interpolate(t("permissions.requestFailed"), { status: response.status })));
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return accessRequest<T>(path, init);
 }
 
 function encodeFormBody(params: URLSearchParams) {
@@ -471,22 +424,24 @@ function buildRealmForm(realm: PveRealm): RealmFormState {
     type: isRealmType(realm.type) ? realm.type : "",
     comment: realm.comment ?? "",
     default: isRealmEnabled(realm.default),
-    tfa: realm.tfa === "oath" || realm.tfa === "yubico" ? realm.tfa : "none",
-    server: realm.server1 ?? realm.server2 ?? "",
+    tfa: realmTfaType(realm.tfa),
+    server: realm.server1 ?? "",
     baseDn: realm.base_dn ?? "",
     userAttribute: realm.user_attr ?? "uid",
     port: realm.port ? String(realm.port) : "",
-    ssl: isRealmEnabled(realm.secure),
+    mode: realm.mode ?? (isRealmEnabled(realm.secure) ? "ldaps" : "ldap"),
+    verify: isRealmEnabled(realm.verify),
+    fallbackServer: realm.server2 ?? "",
+    digest: realm.digest ?? "",
+    tfaConfig: realm.tfa?.includes("=") ? realm.tfa : realm.tfa ? `type=${realm.tfa}` : "",
     bindDn: realm.bind_dn ?? "",
     bindPassword: "",
     domain: realm.domain ?? "",
     issuerUrl: realm["issuer-url"] ?? "",
     clientId: realm["client-id"] ?? "",
-    clientKey: realm["client-key"] ?? "",
+    clientKey: "",
     autocreate: isRealmEnabled(realm.autocreate),
-    usernameClaim: realm["username-claim"] === "username" || realm["username-claim"] === "email"
-      ? realm["username-claim"]
-      : "subject",
+    usernameClaim: realm["username-claim"] ?? "",
   };
 }
 
@@ -505,9 +460,14 @@ function renderCenteredState(title: string, description: string, action?: ReactN
 }
 
 export default function PermissionsPage() {
-  const { t } = useTranslation();
+  const { t, language } = useTranslation();
+  const text = useCallback((en: string, ko: string) => language === "ko" ? ko : en, [language]);
   const emptyValue = t("permissions.none");
 
+  const [securityUser, setSecurityUser] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const loadSequence = useRef(0);
   const [activeTabId, setActiveTabId] = useState("users");
   const [users, setUsers] = useState<PveUser[]>([]);
   const [groups, setGroups] = useState<GroupRow[]>([]);
@@ -570,92 +530,72 @@ export default function PermissionsPage() {
   }, []);
 
   const addSuccess = useCallback((content: string) => {
+    setOperationError(""); setFieldErrors({});
+    const id = `success-${Date.now()}`;
     addFlash({
-      id: `success-${Date.now()}`,
+      id,
       type: "success",
       content,
       dismissible: true,
-      onDismiss: () => dismissFlash(`success-${Date.now()}`),
+      onDismiss: () => dismissFlash(id),
     });
   }, [addFlash, dismissFlash]);
 
   const addError = useCallback((content: string) => {
+    setOperationError(content);
+    const id = `error-${Date.now()}`;
     addFlash({
-      id: `error-${Date.now()}`,
+      id,
       type: "error",
       content,
       dismissible: true,
-      onDismiss: () => dismissFlash(`error-${Date.now()}`),
+      onDismiss: () => dismissFlash(id),
     });
   }, [addFlash, dismissFlash]);
 
   const loadData = useCallback(async () => {
-    try {
-      setLoading(true);
-
-      const [userData, groupIndex, roleIndex, aclData, realmData] = await Promise.all([
-        fetchProxmox<PveUser[]>("/api/proxmox/access/users", t),
-        fetchProxmox<PveGroupListItem[]>("/api/proxmox/access/groups", t),
-        fetchProxmox<PveRoleListItem[]>("/api/proxmox/access/roles", t),
-        fetchProxmox<PveAcl[]>("/api/proxmox/access/acl", t),
-        fetchProxmox<PveRealm[]>("/api/proxmox/access/domains", t),
-      ]);
-
-      const nextGroups = await Promise.all(
-        (groupIndex ?? []).map(async (group) => {
-          const details = await fetchProxmox<PveGroupDetails>(
-            `/api/proxmox/access/groups/${encodeURIComponent(group.groupid)}`,
-            t,
-          );
-
-          return {
-            groupid: group.groupid,
-            comment: details.comment ?? group.comment,
-            users: toList(details.members ?? details.users),
-          } satisfies GroupRow;
-        }),
-      );
-
-      const nextRoles = await Promise.all(
-        (roleIndex ?? []).map(async (role) => {
-          const details = await fetchProxmox<PveRoleDetails>(
-            `/api/proxmox/access/roles/${encodeURIComponent(role.roleid)}`,
-            t,
-          );
-
-          return {
-            roleid: role.roleid,
-            privs: toList(details.privs ?? role.privs),
-            special: isRoleSpecial(details) || isRoleSpecial(role),
-          } satisfies RoleRow;
-        }),
-      );
-
-      setUsers((userData ?? []).sort((a, b) => a.userid.localeCompare(b.userid)));
-      setGroups(nextGroups.sort((a, b) => a.groupid.localeCompare(b.groupid)));
-      setRoles(nextRoles.sort((a, b) => a.roleid.localeCompare(b.roleid)));
-      setAcls(
-        (aclData ?? [])
-          .map((entry) => ({
-            path: entry.path,
-            ugid: entry.ugid,
-            type: getAclType(entry),
-            roleid: entry.roleid,
-            propagate: entry.propagate === true || entry.propagate === 1,
-          }))
-          .sort((a, b) => `${a.path}:${a.ugid}:${a.roleid}`.localeCompare(`${b.path}:${b.ugid}:${b.roleid}`)),
-      );
-      setRealms((realmData ?? []).sort((a, b) => a.realm.localeCompare(b.realm)));
-      setError(null);
-    } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : t("permissions.failedToLoad"));
-    } finally {
-      setLoading(false);
-    }
+    const sequence = ++loadSequence.current;
+    setLoading(true);
+    const results = await Promise.allSettled([
+      fetchProxmox<PveUser[]>("/api/proxmox/access/users?full=1", t),
+      fetchProxmox<PveGroupListItem[]>("/api/proxmox/access/groups", t),
+      fetchProxmox<PveRoleListItem[]>("/api/proxmox/access/roles", t),
+      fetchProxmox<PveAcl[]>("/api/proxmox/access/acl", t),
+      fetchProxmox<PveRealm[]>("/api/proxmox/access/domains", t),
+    ]);
+    if (sequence !== loadSequence.current) return;
+    const [userResult, groupResult, roleResult, aclResult, realmResult] = results;
+    if (userResult.status === "fulfilled") setUsers((userResult.value ?? []).sort((a, b) => a.userid.localeCompare(b.userid)));
+    if (groupResult.status === "fulfilled") setGroups((groupResult.value ?? []).map((group) => ({ ...group, users: toList(group.users) })).sort((a, b) => a.groupid.localeCompare(b.groupid)));
+    if (roleResult.status === "fulfilled") setRoles((roleResult.value ?? []).map((role) => ({ roleid: role.roleid, privs: toList(role.privs), special: isRoleSpecial(role) })).sort((a, b) => a.roleid.localeCompare(b.roleid)));
+    if (aclResult.status === "fulfilled") setAcls((aclResult.value ?? []).map((entry) => ({ ...entry, type: getAclType(entry), propagate: entry.propagate !== false && entry.propagate !== 0 })).sort((a, b) => `${a.path}:${a.ugid}:${a.roleid}`.localeCompare(`${b.path}:${b.ugid}:${b.roleid}`)));
+    if (realmResult.status === "fulfilled") setRealms((realmResult.value ?? []).sort((a, b) => a.realm.localeCompare(b.realm)));
+    const names = [t("permissions.usersTab"), t("permissions.groupsTab"), t("permissions.rolesTab"), t("permissions.aclTab"), t("permissions.realmsTab")];
+    const errors = results.flatMap((result, index) => result.status === "rejected" ? [`${names[index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`] : []);
+    setError(errors.length ? errors.join("; ") : null);
+    setLoading(false);
   }, [t]);
 
+  const editRealm = useCallback(async (realm: PveRealm) => {
+    setRealmSubmitting(true);
+    setOperationError(""); setFieldErrors({});
+    try {
+      const details = await fetchProxmox<PveRealm>(`/api/proxmox/access/domains/${encodeURIComponent(realm.realm)}`, t);
+      const complete = { ...realm, ...details };
+      setSelectedRealm(complete);
+      setRealmForm(buildRealmForm(complete));
+      setOperationError(""); setFieldErrors({});
+                setEditRealmVisible(true);
+    } catch (cause) {
+      addError(cause instanceof Error ? cause.message : String(cause));
+    } finally { setRealmSubmitting(false); }
+  }, [addError, t]);
+
   useEffect(() => {
+    // Start an external request; loading state follows its asynchronous lifecycle.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadData();
+    return () => { loadSequence.current += 1; };
   }, [loadData]);
 
   const userOptions = useMemo<SelectProps.Options>(
@@ -688,13 +628,12 @@ export default function PermissionsPage() {
 
   const realmTypeOptions = useMemo<SelectProps.Options>(
     () => [
-      { label: t("permissions.realmTypePam"), value: "pam" },
-      { label: t("permissions.realmTypePve"), value: "pve" },
+      ...(editRealmVisible ? [{ label: t("permissions.realmTypePam"), value: "pam" }, { label: t("permissions.realmTypePve"), value: "pve" }] : []),
       { label: t("permissions.realmTypeLdap"), value: "ldap" },
       { label: t("permissions.realmTypeAd"), value: "ad" },
       { label: t("permissions.realmTypeOpenid"), value: "openid" },
     ],
-    [t],
+    [editRealmVisible, t],
   );
 
   const realmTfaOptions = useMemo<SelectProps.Options>(
@@ -706,14 +645,6 @@ export default function PermissionsPage() {
     [t],
   );
 
-  const usernameClaimOptions = useMemo<SelectProps.Options>(
-    () => [
-      { label: t("permissions.claimSubject"), value: "subject" },
-      { label: t("permissions.claimUsername"), value: "username" },
-      { label: t("permissions.claimEmail"), value: "email" },
-    ],
-    [t],
-  );
 
   const aclSubjectOptions = useMemo<SelectProps.Options>(() => {
     if (aclForm.subjectType === "group") {
@@ -745,10 +676,6 @@ export default function PermissionsPage() {
     [realmForm.tfa, realmTfaOptions],
   );
 
-  const selectedUsernameClaimOption = useMemo(
-    () => usernameClaimOptions.find((option) => option.value === realmForm.usernameClaim) ?? null,
-    [realmForm.usernameClaim, usernameClaimOptions],
-  );
 
   const getRealmTypeLabel = useCallback((type: string) => {
     switch (type) {
@@ -849,21 +776,25 @@ export default function PermissionsPage() {
         header: t("common.actions"),
         cell: (user) => (
           <SpaceBetween direction="horizontal" size="xs">
-            <Button
+            <Button formAction="none"
               onClick={() => {
                 setSelectedUser(user);
                 setUserForm(buildUserForm(user));
+                setOperationError(""); setFieldErrors({});
                 setEditUserVisible(true);
               }}
             >
               {t("common.edit")}
             </Button>
-            <Button
+            <Button formAction="none" onClick={() => setSecurityUser(user.userid)}>{text("Security", "보안")}</Button>
+            <Button formAction="none"
               variant="inline-icon"
               iconName="remove"
+              disabled={user.userid === "root@pam"}
               ariaLabel={interpolate(t("permissions.deleteUserAriaLabel"), { userid: user.userid })}
               onClick={() => {
                 setSelectedUser(user);
+                setOperationError(""); setFieldErrors({});
                 setDeleteUserVisible(true);
               }}
             />
@@ -872,7 +803,7 @@ export default function PermissionsPage() {
         minWidth: 180,
       },
     ],
-    [emptyValue, t],
+    [emptyValue, t, text],
   );
 
   const groupColumns = useMemo<TableProps<GroupRow>["columnDefinitions"]>(
@@ -904,21 +835,23 @@ export default function PermissionsPage() {
         header: t("common.actions"),
         cell: (group) => (
           <SpaceBetween direction="horizontal" size="xs">
-            <Button
+            <Button formAction="none"
               onClick={() => {
                 setSelectedGroup(group);
                 setGroupForm(buildGroupForm(group));
+                setOperationError(""); setFieldErrors({});
                 setEditGroupVisible(true);
               }}
             >
               {t("common.edit")}
             </Button>
-            <Button
+            <Button formAction="none"
               variant="inline-icon"
               iconName="remove"
               ariaLabel={interpolate(t("permissions.deleteGroupAriaLabel"), { groupid: group.groupid })}
               onClick={() => {
                 setSelectedGroup(group);
+                setOperationError(""); setFieldErrors({});
                 setDeleteGroupVisible(true);
               }}
             />
@@ -968,22 +901,24 @@ export default function PermissionsPage() {
 
           return (
             <SpaceBetween direction="horizontal" size="xs">
-              <Button
+              <Button formAction="none"
                 onClick={() => {
                   setSelectedRole(role);
                   setRoleForm(buildRoleForm(role));
-                  setEditRoleVisible(true);
+                  setOperationError(""); setFieldErrors({});
+                setEditRoleVisible(true);
                 }}
               >
                 {t("common.edit")}
               </Button>
-              <Button
+              <Button formAction="none"
                 variant="inline-icon"
                 iconName="remove"
                 ariaLabel={interpolate(t("permissions.deleteRoleAriaLabel"), { roleid: role.roleid })}
                 onClick={() => {
                   setSelectedRole(role);
-                  setDeleteRoleVisible(true);
+                  setOperationError(""); setFieldErrors({});
+                setDeleteRoleVisible(true);
                 }}
               />
             </SpaceBetween>
@@ -1041,13 +976,14 @@ export default function PermissionsPage() {
         id: "actions",
         header: t("common.actions"),
         cell: (acl) => (
-          <Button
+          <Button formAction="none"
             variant="icon"
             iconName="remove"
             ariaLabel={interpolate(t("permissions.removeAclAriaLabel"), { path: acl.path, subject: acl.ugid })}
             onClick={() => {
               setSelectedAcl(acl);
-              setDeleteAclVisible(true);
+              setOperationError(""); setFieldErrors({});
+                setDeleteAclVisible(true);
             }}
           />
         ),
@@ -1104,16 +1040,13 @@ export default function PermissionsPage() {
         header: t("common.actions"),
         cell: (realm) => (
           <SpaceBetween direction="horizontal" size="xs">
-            <Button
-              onClick={() => {
-                setSelectedRealm(realm);
-                setRealmForm(buildRealmForm(realm));
-                setEditRealmVisible(true);
-              }}
+            <Button formAction="none"
+              disabled={realmSubmitting}
+              onClick={() => void editRealm(realm)}
             >
               {t("common.edit")}
             </Button>
-            <Button
+            <Button formAction="none"
               variant="inline-icon"
               iconName="remove"
               disabled={isBuiltInRealm(realm)}
@@ -1124,6 +1057,7 @@ export default function PermissionsPage() {
                   return;
                 }
                 setSelectedRealm(realm);
+                setOperationError(""); setFieldErrors({});
                 setDeleteRealmVisible(true);
               }}
             />
@@ -1132,37 +1066,37 @@ export default function PermissionsPage() {
         minWidth: 180,
       },
     ],
-    [addError, emptyValue, getRealmTfaLabel, getRealmTypeLabel, t],
+    [addError, editRealm, realmSubmitting, emptyValue, getRealmTfaLabel, getRealmTypeLabel, t],
   );
 
   const userEmptyState = renderCenteredState(
     t("permissions.noUsers"),
     t("permissions.noUsersDescription"),
-    <Button onClick={() => void loadData()}>{t("common.refresh")}</Button>,
+    <Button formAction="none" onClick={() => void loadData()}>{t("common.refresh")}</Button>,
   );
 
   const groupEmptyState = renderCenteredState(
     t("permissions.noGroups"),
     t("permissions.noGroupsDescription"),
-    <Button onClick={() => void loadData()}>{t("common.refresh")}</Button>,
+    <Button formAction="none" onClick={() => void loadData()}>{t("common.refresh")}</Button>,
   );
 
   const roleEmptyState = renderCenteredState(
     t("permissions.noRoles"),
     t("permissions.noRolesDescription"),
-    <Button onClick={() => void loadData()}>{t("common.refresh")}</Button>,
+    <Button formAction="none" onClick={() => void loadData()}>{t("common.refresh")}</Button>,
   );
 
   const aclEmptyState = renderCenteredState(
     t("permissions.noAclEntries"),
     t("permissions.noAclEntriesDescription"),
-    <Button onClick={() => void loadData()}>{t("common.refresh")}</Button>,
+    <Button formAction="none" onClick={() => void loadData()}>{t("common.refresh")}</Button>,
   );
 
   const realmEmptyState = renderCenteredState(
     t("permissions.noRealms"),
     t("permissions.noRealmsDescription"),
-    <Button onClick={() => void loadData()}>{t("common.refresh")}</Button>,
+    <Button formAction="none" onClick={() => void loadData()}>{t("common.refresh")}</Button>,
   );
 
   const {
@@ -1194,7 +1128,9 @@ export default function PermissionsPage() {
       noMatch: renderCenteredState(
         t("common.noMatches"),
         t("permissions.noUsersMatch"),
-        <Button onClick={() => userActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
+        // Cloudscape useCollection documents this deferred callback; it runs only after render initializes actions.
+        // eslint-disable-next-line react-hooks/immutability
+        <Button formAction="none" onClick={() => userActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
       ),
     },
     sorting: {
@@ -1228,7 +1164,9 @@ export default function PermissionsPage() {
       noMatch: renderCenteredState(
         t("common.noMatches"),
         t("permissions.noGroupsMatch"),
-        <Button onClick={() => groupActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
+        // Cloudscape useCollection documents this deferred callback; it runs only after render initializes actions.
+        // eslint-disable-next-line react-hooks/immutability
+        <Button formAction="none" onClick={() => groupActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
       ),
     },
     sorting: {
@@ -1266,7 +1204,9 @@ export default function PermissionsPage() {
       noMatch: renderCenteredState(
         t("common.noMatches"),
         t("permissions.noRolesMatch"),
-        <Button onClick={() => roleActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
+        // Cloudscape useCollection documents this deferred callback; it runs only after render initializes actions.
+        // eslint-disable-next-line react-hooks/immutability
+        <Button formAction="none" onClick={() => roleActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
       ),
     },
     sorting: {
@@ -1306,7 +1246,9 @@ export default function PermissionsPage() {
       noMatch: renderCenteredState(
         t("common.noMatches"),
         t("permissions.noAclEntriesMatch"),
-        <Button onClick={() => aclActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
+        // Cloudscape useCollection documents this deferred callback; it runs only after render initializes actions.
+        // eslint-disable-next-line react-hooks/immutability
+        <Button formAction="none" onClick={() => aclActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
       ),
     },
     sorting: {
@@ -1346,7 +1288,9 @@ export default function PermissionsPage() {
       noMatch: renderCenteredState(
         t("common.noMatches"),
         t("permissions.noRealmsMatch"),
-        <Button onClick={() => realmActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
+        // Cloudscape useCollection documents this deferred callback; it runs only after render initializes actions.
+        // eslint-disable-next-line react-hooks/immutability
+        <Button formAction="none" onClick={() => realmActions.setFiltering("")}>{t("common.clearFilter")}</Button>,
       ),
     },
     sorting: {
@@ -1376,27 +1320,35 @@ export default function PermissionsPage() {
   );
 
   const submitUser = useCallback(async (mode: "create" | "edit") => {
-    if (!userForm.userid.trim()) {
-      addError(t("permissions.userIdRequired"));
+    if (!isValidUserId(userForm.userid.trim())) {
+      setFieldErrors({ userid: text("Use name@realm, up to 64 characters.", "name@realm 형식으로 최대 64자를 입력하세요.") });
+      addError(text("Enter a valid user ID including a realm, such as operator@pve (maximum 64 characters).", "operator@pve처럼 영역을 포함한 유효한 사용자 ID를 입력하세요 (최대 64자)."));
       return;
     }
 
+    const realmId = userForm.userid.trim().slice(userForm.userid.trim().lastIndexOf("@") + 1);
+    const userRealm = realms.find((realm) => realm.realm === realmId);
+    if (mode === "create" && userForm.password && userRealm && userRealm.type !== "pve" && userRealm.type !== "pam") {
+      addError(text("External directory passwords are managed by the identity provider. Clear the initial password to create this user.", "외부 디렉터리 비밀번호는 인증 제공자에서 관리합니다. 초기 비밀번호를 비우고 사용자를 생성하세요."));
+      return;
+    }
     const expireResult = parseExpireInput(userForm.expire);
     if (!expireResult.valid) {
+      setFieldErrors({ expire: t("permissions.invalidExpireDate") });
       addError(t("permissions.invalidExpireDate"));
       return;
     }
 
-    if (mode === "create" && !userForm.password.trim()) {
-      addError(t("permissions.passwordRequired"));
+    if (mode === "create" && userForm.password && (userForm.password.length < 8 || userForm.password.length > 64)) {
+      addError(text("Password must contain 8 to 64 characters.", "비밀번호는 8~64자여야 합니다."));
       return;
     }
 
     try {
       setUserSubmitting(true);
       const params = new URLSearchParams();
-      params.set("userid", userForm.userid.trim());
-      params.set("groups", userForm.groups.trim());
+      if (mode === "create") params.set("userid", userForm.userid.trim());
+      params.set("groups", toList(userForm.groups).join(","));
       params.set("email", userForm.email.trim());
       params.set("firstname", userForm.firstname.trim());
       params.set("lastname", userForm.lastname.trim());
@@ -1404,7 +1356,7 @@ export default function PermissionsPage() {
       params.set("enable", userForm.enabled ? "1" : "0");
       params.set("expire", expireResult.epoch);
 
-      if (userForm.password.trim()) {
+      if (mode === "create" && userForm.password) {
         params.set("password", userForm.password);
       }
 
@@ -1424,14 +1376,15 @@ export default function PermissionsPage() {
       setSelectedUser(null);
       addSuccess(mode === "create" ? t("permissions.userCreated") : t("permissions.userUpdated"));
     } catch (submitError) {
+      if (submitError instanceof AccessApiError) setFieldErrors(submitError.fields);
       addError(submitError instanceof Error ? submitError.message : t(mode === "create" ? "permissions.failedToCreateUser" : "permissions.failedToUpdateUser"));
     } finally {
       setUserSubmitting(false);
     }
-  }, [addError, addSuccess, loadData, t, userForm]);
+  }, [addError, addSuccess, loadData, realms, t, text, userForm]);
 
   const deleteUser = useCallback(async () => {
-    if (!selectedUser) {
+    if (!selectedUser || selectedUser.userid === "root@pam") {
       return;
     }
 
@@ -1445,6 +1398,7 @@ export default function PermissionsPage() {
       setSelectedUser(null);
       addSuccess(t("permissions.userDeleted"));
     } catch (deleteError) {
+      if (deleteError instanceof AccessApiError) setFieldErrors(deleteError.fields);
       addError(deleteError instanceof Error ? deleteError.message : t("permissions.failedToDeleteUser"));
     } finally {
       setUserSubmitting(false);
@@ -1452,15 +1406,16 @@ export default function PermissionsPage() {
   }, [addError, addSuccess, loadData, selectedUser, t]);
 
   const submitGroup = useCallback(async (mode: "create" | "edit") => {
-    if (!groupForm.groupid.trim()) {
-      addError(t("permissions.groupIdRequired"));
+    if (!isValidAccessId(groupForm.groupid.trim())) {
+      setFieldErrors({ groupid: text("Enter a valid group ID.", "유효한 그룹 ID를 입력하세요.") });
+      addError(text("Group ID can contain letters, digits, periods, hyphens and underscores.", "그룹 ID에는 영문자, 숫자, 마침표, 하이픈, 밑줄을 사용할 수 있습니다."));
       return;
     }
 
     try {
       setGroupSubmitting(true);
       const params = new URLSearchParams();
-      params.set("groupid", groupForm.groupid.trim());
+      if (mode === "create") params.set("groupid", groupForm.groupid.trim());
       params.set("comment", groupForm.comment.trim());
 
       const path = mode === "create"
@@ -1479,11 +1434,12 @@ export default function PermissionsPage() {
       setSelectedGroup(null);
       addSuccess(mode === "create" ? t("permissions.groupCreated") : t("permissions.groupUpdated"));
     } catch (submitError) {
+      if (submitError instanceof AccessApiError) setFieldErrors(submitError.fields);
       addError(submitError instanceof Error ? submitError.message : t(mode === "create" ? "permissions.failedToCreateGroup" : "permissions.failedToUpdateGroup"));
     } finally {
       setGroupSubmitting(false);
     }
-  }, [addError, addSuccess, groupForm, loadData, t]);
+  }, [addError, addSuccess, groupForm, loadData, t, text]);
 
   const deleteGroup = useCallback(async () => {
     if (!selectedGroup) {
@@ -1500,6 +1456,7 @@ export default function PermissionsPage() {
       setSelectedGroup(null);
       addSuccess(t("permissions.groupDeleted"));
     } catch (deleteError) {
+      if (deleteError instanceof AccessApiError) setFieldErrors(deleteError.fields);
       addError(deleteError instanceof Error ? deleteError.message : t("permissions.failedToDeleteGroup"));
     } finally {
       setGroupSubmitting(false);
@@ -1507,21 +1464,17 @@ export default function PermissionsPage() {
   }, [addError, addSuccess, loadData, selectedGroup, t]);
 
   const submitRole = useCallback(async (mode: "create" | "edit") => {
-    if (!roleForm.roleid.trim()) {
-      addError(t("permissions.roleIdRequired"));
-      return;
-    }
-
-    if (!roleForm.privs.trim()) {
-      addError(t("permissions.privilegesRequired"));
+    if (!isValidAccessId(roleForm.roleid.trim())) {
+      setFieldErrors({ roleid: text("Enter a valid role ID.", "유효한 역할 ID를 입력하세요.") });
+      addError(text("Role ID can contain letters, digits, periods, hyphens and underscores.", "역할 ID에는 영문자, 숫자, 마침표, 하이픈, 밑줄을 사용할 수 있습니다."));
       return;
     }
 
     try {
       setRoleSubmitting(true);
       const params = new URLSearchParams();
-      params.set("roleid", roleForm.roleid.trim());
-      params.set("privs", roleForm.privs.trim());
+      if (mode === "create") params.set("roleid", roleForm.roleid.trim());
+      params.set("privs", toList(roleForm.privs).join(","));
 
       const path = mode === "create"
         ? "/api/proxmox/access/roles"
@@ -1539,14 +1492,15 @@ export default function PermissionsPage() {
       setSelectedRole(null);
       addSuccess(mode === "create" ? t("permissions.roleCreated") : t("permissions.roleUpdated"));
     } catch (submitError) {
+      if (submitError instanceof AccessApiError) setFieldErrors(submitError.fields);
       addError(submitError instanceof Error ? submitError.message : t(mode === "create" ? "permissions.failedToCreateRole" : "permissions.failedToUpdateRole"));
     } finally {
       setRoleSubmitting(false);
     }
-  }, [addError, addSuccess, loadData, roleForm, t]);
+  }, [addError, addSuccess, loadData, roleForm, t, text]);
 
   const deleteRole = useCallback(async () => {
-    if (!selectedRole) {
+    if (!selectedRole || selectedRole.special) {
       return;
     }
 
@@ -1560,6 +1514,7 @@ export default function PermissionsPage() {
       setSelectedRole(null);
       addSuccess(t("permissions.roleDeleted"));
     } catch (deleteError) {
+      if (deleteError instanceof AccessApiError) setFieldErrors(deleteError.fields);
       addError(deleteError instanceof Error ? deleteError.message : t("permissions.failedToDeleteRole"));
     } finally {
       setRoleSubmitting(false);
@@ -1567,8 +1522,8 @@ export default function PermissionsPage() {
   }, [addError, addSuccess, loadData, selectedRole, t]);
 
   const submitAcl = useCallback(async () => {
-    if (!aclForm.path.trim()) {
-      addError(t("permissions.pathRequired"));
+    if (!aclForm.path.trim().startsWith("/") || /\s|\/\/|(?:^|\/)\.\.?(?:\/|$)/.test(aclForm.path.trim())) {
+      addError(text("Enter an absolute Proxmox ACL path, such as /vms/100, without spaces or traversal segments.", "공백이나 상대 경로 없이 /vms/100처럼 절대 Proxmox ACL 경로를 입력하세요."));
       return;
     }
 
@@ -1607,11 +1562,12 @@ export default function PermissionsPage() {
       setAclForm(EMPTY_ACL_FORM);
       addSuccess(t("permissions.aclAdded"));
     } catch (submitError) {
+      if (submitError instanceof AccessApiError) setFieldErrors(submitError.fields);
       addError(submitError instanceof Error ? submitError.message : t("permissions.failedToAddAcl"));
     } finally {
       setAclSubmitting(false);
     }
-  }, [aclForm, addError, addSuccess, loadData, t]);
+  }, [aclForm, addError, addSuccess, loadData, t, text]);
 
   const deleteAcl = useCallback(async () => {
     if (!selectedAcl) {
@@ -1644,6 +1600,7 @@ export default function PermissionsPage() {
       setSelectedAcl(null);
       addSuccess(t("permissions.aclRemoved"));
     } catch (deleteError) {
+      if (deleteError instanceof AccessApiError) setFieldErrors(deleteError.fields);
       addError(deleteError instanceof Error ? deleteError.message : t("permissions.failedToRemoveAcl"));
     } finally {
       setAclSubmitting(false);
@@ -1692,9 +1649,23 @@ export default function PermissionsPage() {
       return;
     }
 
+    if (mode === "create" && (!/^[A-Za-z][A-Za-z0-9._-]+$/.test(realmForm.realm.trim()) || realmForm.realm.length > 32 || realmForm.type === "pam" || realmForm.type === "pve")) {
+      addError(text("Enter a new LDAP, AD or OpenID realm ID (2 to 32 characters, starting with a letter).", "새 LDAP, AD 또는 OpenID 영역 ID를 입력하세요 (영문자로 시작하는 2~32자)."));
+      return;
+    }
+    if (realmForm.port && (!/^\d+$/.test(realmForm.port) || Number(realmForm.port) < 1 || Number(realmForm.port) > 65535)) {
+      addError(text("Port must be an integer between 1 and 65535.", "포트는 1~65535 사이의 정수여야 합니다."));
+      return;
+    }
+    if (realmForm.type === "openid") {
+      try { const url = new URL(realmForm.issuerUrl); if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error(); }
+      catch { addError(text("Enter a valid OpenID issuer URL.", "유효한 OpenID 발급자 URL을 입력하세요.")); return; }
+    }
     try {
       setRealmSubmitting(true);
       const params = new URLSearchParams();
+      const deleteFields: string[] = [];
+      if (mode === "edit" && realmForm.digest) params.set("digest", realmForm.digest);
 
       if (mode === "create") {
         params.set("realm", realmForm.realm.trim());
@@ -1703,37 +1674,53 @@ export default function PermissionsPage() {
 
       params.set("comment", realmForm.comment.trim());
       params.set("default", realmForm.default ? "1" : "0");
-      params.set("tfa", realmForm.tfa);
+      if (realmForm.type !== "openid") {
+        if (realmForm.tfa === "none") { if (mode === "edit" && selectedRealm?.tfa) deleteFields.push("tfa"); }
+        else params.set("tfa", realmForm.tfaConfig || `type=${realmForm.tfa}`);
+      }
 
       if (realmForm.type === "ldap") {
         params.set("server1", realmForm.server.trim());
         params.set("base_dn", realmForm.baseDn.trim());
         params.set("user_attr", realmForm.userAttribute.trim() || "uid");
-        params.set("port", realmForm.port.trim());
-        params.set("secure", realmForm.ssl ? "1" : "0");
-        params.set("bind_dn", realmForm.bindDn.trim());
+        if (realmForm.port) params.set("port", realmForm.port);
+        else if (mode === "edit" && selectedRealm?.port) deleteFields.push("port");
+        params.set("mode", realmForm.mode);
+        params.set("verify", realmForm.verify ? "1" : "0");
+        if (realmForm.fallbackServer) params.set("server2", realmForm.fallbackServer);
+        else if (mode === "edit" && selectedRealm?.server2) deleteFields.push("server2");
+        if (realmForm.bindDn.trim()) params.set("bind_dn", realmForm.bindDn.trim());
+        else if (mode === "edit" && selectedRealm?.bind_dn) deleteFields.push("bind_dn");
         if (realmForm.bindPassword.trim()) {
           params.set("password", realmForm.bindPassword);
         }
       }
 
       if (realmForm.type === "ad") {
+        if (realmForm.bindDn.trim()) params.set("bind_dn", realmForm.bindDn.trim());
+        else if (mode === "edit" && selectedRealm?.bind_dn) deleteFields.push("bind_dn");
+        if (realmForm.bindPassword) params.set("password", realmForm.bindPassword);
         params.set("server1", realmForm.server.trim());
         params.set("domain", realmForm.domain.trim());
-        params.set("port", realmForm.port.trim());
-        params.set("secure", realmForm.ssl ? "1" : "0");
+        if (realmForm.port) params.set("port", realmForm.port);
+        else if (mode === "edit" && selectedRealm?.port) deleteFields.push("port");
+        params.set("mode", realmForm.mode);
+        params.set("verify", realmForm.verify ? "1" : "0");
+        if (realmForm.fallbackServer) params.set("server2", realmForm.fallbackServer);
+        else if (mode === "edit" && selectedRealm?.server2) deleteFields.push("server2");
       }
 
       if (realmForm.type === "openid") {
         params.set("issuer-url", realmForm.issuerUrl.trim());
         params.set("client-id", realmForm.clientId.trim());
         params.set("autocreate", realmForm.autocreate ? "1" : "0");
-        params.set("username-claim", realmForm.usernameClaim);
+        if (mode === "create" && realmForm.usernameClaim) params.set("username-claim", realmForm.usernameClaim);
         if (realmForm.clientKey.trim()) {
           params.set("client-key", realmForm.clientKey);
         }
       }
 
+      if (deleteFields.length) params.set("delete", deleteFields.join(","));
       const realmId = realmForm.realm.trim();
       const path = mode === "create"
         ? "/api/proxmox/access/domains"
@@ -1751,11 +1738,12 @@ export default function PermissionsPage() {
       setSelectedRealm(null);
       addSuccess(interpolate(t(mode === "create" ? "permissions.realmCreated" : "permissions.realmUpdated"), { realm: realmId }));
     } catch (submitError) {
+      if (submitError instanceof AccessApiError) setFieldErrors(submitError.fields);
       addError(submitError instanceof Error ? submitError.message : t(mode === "create" ? "permissions.createRealmFailed" : "permissions.updateRealmFailed"));
     } finally {
       setRealmSubmitting(false);
     }
-  }, [addError, addSuccess, loadData, realmForm, t]);
+  }, [addError, addSuccess, loadData, realmForm, selectedRealm, t, text]);
 
   const deleteRealm = useCallback(async () => {
     if (!selectedRealm) {
@@ -1777,6 +1765,7 @@ export default function PermissionsPage() {
       setSelectedRealm(null);
       addSuccess(interpolate(t("permissions.realmDeleted"), { realm: selectedRealm.realm }));
     } catch (deleteError) {
+      if (deleteError instanceof AccessApiError) setFieldErrors(deleteError.fields);
       addError(deleteError instanceof Error ? deleteError.message : t("permissions.deleteRealmFailed"));
     } finally {
       setRealmSubmitting(false);
@@ -1784,8 +1773,8 @@ export default function PermissionsPage() {
   }, [addError, addSuccess, loadData, selectedRealm, t]);
 
   const realmFields = (
-    <SpaceBetween size="m">
-      <FormField label={t("permissions.realmId")}>
+    <SpaceBetween size="l">
+      <FormField errorText={fieldErrors["realm"]} label={t("permissions.realmId")}>
         <Input
           value={realmForm.realm}
           disabled={editRealmVisible}
@@ -1793,7 +1782,7 @@ export default function PermissionsPage() {
           onChange={({ detail }) => setRealmForm((current) => ({ ...current, realm: detail.value }))}
         />
       </FormField>
-      <FormField label={t("permissions.realmType")}>
+      <FormField errorText={fieldErrors["type"]} label={t("permissions.realmType")}>
         <Select
           selectedOption={selectedRealmTypeOption}
           options={realmTypeOptions}
@@ -1805,7 +1794,7 @@ export default function PermissionsPage() {
               ...current,
               type: isRealmType(nextType) ? nextType : "",
               userAttribute: current.userAttribute || "uid",
-              usernameClaim: current.usernameClaim || "subject",
+              usernameClaim: current.usernameClaim,
             }));
           }}
         />
@@ -1820,7 +1809,7 @@ export default function PermissionsPage() {
       <Checkbox checked={realmForm.default} onChange={({ detail }) => setRealmForm((current) => ({ ...current, default: detail.checked }))}>
         {t("permissions.realmDefault")}
       </Checkbox>
-      <FormField label={t("permissions.realmTfa")}>
+      {realmForm.type !== "openid" && <FormField label={t("permissions.realmTfa")}>
         <Select
           selectedOption={selectedRealmTfaOption}
           options={realmTfaOptions}
@@ -1830,100 +1819,106 @@ export default function PermissionsPage() {
             setRealmForm((current) => ({
               ...current,
               tfa: nextValue === "oath" || nextValue === "yubico" ? nextValue : "none",
+              tfaConfig: nextValue === "none" ? "" : `type=${nextValue}`,
             }));
           }}
         />
-      </FormField>
-
-      {realmForm.type === "ldap" ? (
-        <>
-          <FormField label={t("permissions.ldapServer")}>
-            <Input
-              value={realmForm.server}
-              placeholder={t("permissions.ldapServerPlaceholder")}
-              onChange={({ detail }) => setRealmForm((current) => ({ ...current, server: detail.value }))}
-            />
-          </FormField>
-          <FormField label={t("permissions.baseDn")}>
-            <Input
-              value={realmForm.baseDn}
-              placeholder={t("permissions.baseDnPlaceholder")}
-              onChange={({ detail }) => setRealmForm((current) => ({ ...current, baseDn: detail.value }))}
-            />
-          </FormField>
-          <FormField label={t("permissions.userAttribute")}>
-            <Input
-              value={realmForm.userAttribute}
-              placeholder={t("permissions.userAttributePlaceholder")}
-              onChange={({ detail }) => setRealmForm((current) => ({ ...current, userAttribute: detail.value }))}
-            />
-          </FormField>
-          <FormField label={t("permissions.ldapPort")}>
-            <Input
-              value={realmForm.port}
-              placeholder={t("permissions.ldapPortPlaceholder")}
-              onChange={({ detail }) => setRealmForm((current) => ({ ...current, port: detail.value }))}
-            />
-          </FormField>
-          <Checkbox checked={realmForm.ssl} onChange={({ detail }) => setRealmForm((current) => ({ ...current, ssl: detail.checked }))}>
-            {t("permissions.ldapSsl")}
-          </Checkbox>
-          <FormField label={t("permissions.bindDn")}>
+      </FormField>}
+      {realmForm.type !== "openid" && realmForm.tfa !== "none" && <FormField label={text("Realm TFA configuration", "영역 2단계 인증 설정")} constraintText="type=oath,digits=6,step=30 / type=yubico,id=…,key=…">
+        <Input value={realmForm.tfaConfig} onChange={({ detail }) => setRealmForm((current) => ({ ...current, tfaConfig: detail.value }))} />
+      </FormField>}
+      {(realmForm.type === "ldap" || realmForm.type === "ad") && <>
+        <FormField label={text("Fallback server — optional", "대체 서버 — 선택 사항")}><Input value={realmForm.fallbackServer} onChange={({ detail }) => setRealmForm((current) => ({ ...current, fallbackServer: detail.value }))} /></FormField>
+        <FormField label={text("Connection security", "연결 보안")}><Select selectedOption={{ label: realmForm.mode, value: realmForm.mode }} options={[{ label: "LDAPS", value: "ldaps" }, { label: "LDAP with STARTTLS", value: "ldap+starttls" }, { label: "LDAP", value: "ldap" }]} onChange={({ detail }) => setRealmForm((current) => ({ ...current, mode: detail.selectedOption.value as RealmFormState["mode"] }))} /></FormField>
+        <Checkbox checked={realmForm.verify} onChange={({ detail }) => setRealmForm((current) => ({ ...current, verify: detail.checked }))}>{text("Verify server certificate", "서버 인증서 검증")}</Checkbox>
+          <FormField errorText={fieldErrors["bind_dn"]} label={t("permissions.bindDn")}>
             <Input
               value={realmForm.bindDn}
               placeholder={t("permissions.bindDnPlaceholder")}
               onChange={({ detail }) => setRealmForm((current) => ({ ...current, bindDn: detail.value }))}
             />
           </FormField>
-          <FormField label={t("permissions.bindPassword")}>
+          <FormField errorText={fieldErrors["password"]} label={t("permissions.bindPassword")}>
             <Input
               type="password"
               value={realmForm.bindPassword}
               onChange={({ detail }) => setRealmForm((current) => ({ ...current, bindPassword: detail.value }))}
             />
           </FormField>
-        </>
-      ) : null}
 
-      {realmForm.type === "ad" ? (
+      </>}
+
+      {realmForm.type === "ldap" ? (
         <>
-          <FormField label={t("permissions.adServer")}>
+          <FormField errorText={fieldErrors["server1"]} label={t("permissions.ldapServer")}>
             <Input
               value={realmForm.server}
-              placeholder={t("permissions.adServerPlaceholder")}
+              placeholder={t("permissions.ldapServerPlaceholder")}
               onChange={({ detail }) => setRealmForm((current) => ({ ...current, server: detail.value }))}
             />
           </FormField>
-          <FormField label={t("permissions.adDomain")}>
+          <FormField errorText={fieldErrors["base_dn"]} label={t("permissions.baseDn")}>
             <Input
-              value={realmForm.domain}
-              placeholder={t("permissions.adDomainPlaceholder")}
-              onChange={({ detail }) => setRealmForm((current) => ({ ...current, domain: detail.value }))}
+              value={realmForm.baseDn}
+              placeholder={t("permissions.baseDnPlaceholder")}
+              onChange={({ detail }) => setRealmForm((current) => ({ ...current, baseDn: detail.value }))}
             />
           </FormField>
-          <FormField label={t("permissions.ldapPort")}>
+          <FormField errorText={fieldErrors["user_attr"]} label={t("permissions.userAttribute")}>
+            <Input
+              value={realmForm.userAttribute}
+              placeholder={t("permissions.userAttributePlaceholder")}
+              onChange={({ detail }) => setRealmForm((current) => ({ ...current, userAttribute: detail.value }))}
+            />
+          </FormField>
+          <FormField errorText={fieldErrors["port"]} label={t("permissions.ldapPort")}>
             <Input
               value={realmForm.port}
               placeholder={t("permissions.ldapPortPlaceholder")}
               onChange={({ detail }) => setRealmForm((current) => ({ ...current, port: detail.value }))}
             />
           </FormField>
-          <Checkbox checked={realmForm.ssl} onChange={({ detail }) => setRealmForm((current) => ({ ...current, ssl: detail.checked }))}>
-            {t("permissions.ldapSsl")}
-          </Checkbox>
+
+        </>
+      ) : null}
+
+      {realmForm.type === "ad" ? (
+        <>
+          <FormField errorText={fieldErrors["server1"]} label={t("permissions.adServer")}>
+            <Input
+              value={realmForm.server}
+              placeholder={t("permissions.adServerPlaceholder")}
+              onChange={({ detail }) => setRealmForm((current) => ({ ...current, server: detail.value }))}
+            />
+          </FormField>
+          <FormField errorText={fieldErrors["domain"]} label={t("permissions.adDomain")}>
+            <Input
+              value={realmForm.domain}
+              placeholder={t("permissions.adDomainPlaceholder")}
+              onChange={({ detail }) => setRealmForm((current) => ({ ...current, domain: detail.value }))}
+            />
+          </FormField>
+          <FormField errorText={fieldErrors["port"]} label={t("permissions.ldapPort")}>
+            <Input
+              value={realmForm.port}
+              placeholder={t("permissions.ldapPortPlaceholder")}
+              onChange={({ detail }) => setRealmForm((current) => ({ ...current, port: detail.value }))}
+            />
+          </FormField>
+
         </>
       ) : null}
 
       {realmForm.type === "openid" ? (
         <>
-          <FormField label={t("permissions.openidIssuerUrl")}>
+          <FormField errorText={fieldErrors["issuer-url"]} label={t("permissions.openidIssuerUrl")}>
             <Input
               value={realmForm.issuerUrl}
               placeholder={t("permissions.openidIssuerUrlPlaceholder")}
               onChange={({ detail }) => setRealmForm((current) => ({ ...current, issuerUrl: detail.value }))}
             />
           </FormField>
-          <FormField label={t("permissions.openidClientId")}>
+          <FormField errorText={fieldErrors["client-id"]} label={t("permissions.openidClientId")}>
             <Input
               value={realmForm.clientId}
               placeholder={t("permissions.openidClientIdPlaceholder")}
@@ -1941,19 +1936,8 @@ export default function PermissionsPage() {
           <Checkbox checked={realmForm.autocreate} onChange={({ detail }) => setRealmForm((current) => ({ ...current, autocreate: detail.checked }))}>
             {t("permissions.openidAutocreate")}
           </Checkbox>
-          <FormField label={t("permissions.openidUsernameClaim")}>
-            <Select
-              selectedOption={selectedUsernameClaimOption}
-              options={usernameClaimOptions}
-              placeholder={t("permissions.selectUsernameClaim")}
-              onChange={({ detail }) => {
-                const nextValue = getTrackableId(detail.selectedOption);
-                setRealmForm((current) => ({
-                  ...current,
-                  usernameClaim: nextValue === "username" || nextValue === "email" ? nextValue : "subject",
-                }));
-              }}
-            />
+          <FormField label={t("permissions.openidUsernameClaim")} description={text("Leave empty to use the provider default. This setting cannot be changed after creation.", "비워 두면 제공자의 기본값을 사용합니다. 생성한 뒤에는 변경할 수 없습니다.")}>
+            <Input disabled={editRealmVisible} value={realmForm.usernameClaim} onChange={({ detail }) => setRealmForm((current) => ({ ...current, usernameClaim: detail.value }))} />
           </FormField>
         </>
       ) : null}
@@ -2000,7 +1984,7 @@ export default function PermissionsPage() {
                 loading={loading}
                 loadingText={t("permissions.loadingUsers")}
                 trackBy="userid"
-                empty={userFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noUsersMatch"), <Button onClick={() => userActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : userEmptyState}
+                empty={userFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noUsersMatch"), <Button formAction="none" onClick={() => userActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : userEmptyState}
                 wrapLines={userPreferences.wrapLines}
                 stripedRows={userPreferences.stripedRows}
                 contentDensity={userPreferences.contentDensity}
@@ -2011,11 +1995,12 @@ export default function PermissionsPage() {
                     description={t("permissions.usersDescription")}
                     actions={
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Button
+                        <Button formAction="none"
                           variant="primary"
                           onClick={() => {
                             setUserForm(EMPTY_USER_FORM);
-                            setCreateUserVisible(true);
+                            setOperationError(""); setFieldErrors({});
+                setCreateUserVisible(true);
                           }}
                         >
                           {t("permissions.createUser")}
@@ -2096,7 +2081,7 @@ export default function PermissionsPage() {
                 loading={loading}
                 loadingText={t("permissions.loadingGroups")}
                 trackBy="groupid"
-                empty={groupFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noGroupsMatch"), <Button onClick={() => groupActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : groupEmptyState}
+                empty={groupFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noGroupsMatch"), <Button formAction="none" onClick={() => groupActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : groupEmptyState}
                 wrapLines={groupPreferences.wrapLines}
                 stripedRows={groupPreferences.stripedRows}
                 contentDensity={groupPreferences.contentDensity}
@@ -2107,11 +2092,12 @@ export default function PermissionsPage() {
                     description={t("permissions.groupsDescription")}
                     actions={
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Button
+                        <Button formAction="none"
                           variant="primary"
                           onClick={() => {
                             setGroupForm(EMPTY_GROUP_FORM);
-                            setCreateGroupVisible(true);
+                            setOperationError(""); setFieldErrors({});
+                setCreateGroupVisible(true);
                           }}
                         >
                           {t("permissions.createGroup")}
@@ -2187,7 +2173,7 @@ export default function PermissionsPage() {
                 loading={loading}
                 loadingText={t("permissions.loadingRoles")}
                 trackBy="roleid"
-                empty={roleFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noRolesMatch"), <Button onClick={() => roleActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : roleEmptyState}
+                empty={roleFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noRolesMatch"), <Button formAction="none" onClick={() => roleActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : roleEmptyState}
                 wrapLines={rolePreferences.wrapLines}
                 stripedRows={rolePreferences.stripedRows}
                 contentDensity={rolePreferences.contentDensity}
@@ -2198,11 +2184,12 @@ export default function PermissionsPage() {
                     description={t("permissions.rolesDescription")}
                     actions={
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Button
+                        <Button formAction="none"
                           variant="primary"
                           onClick={() => {
                             setRoleForm(EMPTY_ROLE_FORM);
-                            setCreateRoleVisible(true);
+                            setOperationError(""); setFieldErrors({});
+                setCreateRoleVisible(true);
                           }}
                         >
                           {t("permissions.createRole")}
@@ -2278,7 +2265,7 @@ export default function PermissionsPage() {
                 loading={loading}
                 loadingText={t("permissions.loadingRealms")}
                 trackBy="realm"
-                empty={realmFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noRealmsMatch"), <Button onClick={() => realmActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : realmEmptyState}
+                empty={realmFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noRealmsMatch"), <Button formAction="none" onClick={() => realmActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : realmEmptyState}
                 wrapLines={realmPreferences.wrapLines}
                 stripedRows={realmPreferences.stripedRows}
                 contentDensity={realmPreferences.contentDensity}
@@ -2289,12 +2276,13 @@ export default function PermissionsPage() {
                     description={t("permissions.realmsDescription")}
                     actions={
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Button
+                        <Button formAction="none"
                           variant="primary"
                           onClick={() => {
                             setRealmForm(EMPTY_REALM_FORM);
                             setSelectedRealm(null);
-                            setCreateRealmVisible(true);
+                            setOperationError(""); setFieldErrors({});
+                setCreateRealmVisible(true);
                           }}
                         >
                           {t("permissions.createRealm")}
@@ -2372,7 +2360,7 @@ export default function PermissionsPage() {
                 loading={loading}
                 loadingText={t("permissions.loadingAcl")}
                 trackBy={(item) => `${item.path}:${item.type}:${item.ugid}:${item.roleid}`}
-                empty={aclFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noAclEntriesMatch"), <Button onClick={() => aclActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : aclEmptyState}
+                empty={aclFilterProps.filteringText ? renderCenteredState(t("common.noMatches"), t("permissions.noAclEntriesMatch"), <Button formAction="none" onClick={() => aclActions.setFiltering("")}>{t("common.clearFilter")}</Button>) : aclEmptyState}
                 wrapLines={aclPreferences.wrapLines}
                 stripedRows={aclPreferences.stripedRows}
                 contentDensity={aclPreferences.contentDensity}
@@ -2383,16 +2371,17 @@ export default function PermissionsPage() {
                     description={t("permissions.aclDescription")}
                     actions={
                       <SpaceBetween direction="horizontal" size="xs">
-                        <Button
+                        <Button formAction="none"
                           variant="primary"
                           onClick={() => {
                             setAclForm({
                               ...EMPTY_ACL_FORM,
                               subjectType: userOptions.length > 0 ? "user" : groupOptions.length > 0 ? "group" : tokenOptions.length > 0 ? "token" : "user",
-                              subjectId: userOptions[0]?.value as string ?? groupOptions[0]?.value as string ?? tokenOptions[0]?.value as string ?? "",
-                              roleid: roleOptions[0]?.value as string ?? "",
+                              subjectId: "",
+                              roleid: "",
                             });
-                            setCreateAclVisible(true);
+                            setOperationError(""); setFieldErrors({});
+                setCreateAclVisible(true);
                           }}
                         >
                           {t("permissions.addAcl")}
@@ -2458,299 +2447,325 @@ export default function PermissionsPage() {
         ]}
       />
 
-      <Modal
-        visible={createRealmVisible}
-        onDismiss={() => setCreateRealmVisible(false)}
+      {securityUser && <UserSecurity userid={securityUser} onDismiss={() => setSecurityUser(null)} onChanged={loadData} />}
+
+      {createRealmVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!realmSubmitting) { setCreateRealmVisible(false); setOperationError(""); setFieldErrors({}); setRealmForm(EMPTY_REALM_FORM); } }}
         header={t("permissions.createRealmModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setCreateRealmVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={realmSubmitting} onClick={() => { setCreateRealmVisible(false); setOperationError(""); setFieldErrors({}); setRealmForm(EMPTY_REALM_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={realmSubmitting} onClick={() => void submitRealm("create")}>{t("common.create")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         {realmFields}
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={editRealmVisible}
-        onDismiss={() => setEditRealmVisible(false)}
+      {editRealmVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!realmSubmitting) { setEditRealmVisible(false); setOperationError(""); setFieldErrors({}); setRealmForm(EMPTY_REALM_FORM); } }}
         header={t("permissions.editRealmModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setEditRealmVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={realmSubmitting} onClick={() => { setEditRealmVisible(false); setOperationError(""); setFieldErrors({}); setRealmForm(EMPTY_REALM_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={realmSubmitting} onClick={() => void submitRealm("edit")}>{t("common.save")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         {realmFields}
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={deleteRealmVisible}
-        onDismiss={() => setDeleteRealmVisible(false)}
+      {deleteRealmVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!realmSubmitting) { setDeleteRealmVisible(false); setOperationError(""); setFieldErrors({}); } }}
         header={t("permissions.deleteRealmModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setDeleteRealmVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={realmSubmitting} onClick={() => { setDeleteRealmVisible(false); setOperationError(""); setFieldErrors({}); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={realmSubmitting} onClick={() => void deleteRealm()}>{t("common.delete")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         <Box>
           {selectedRealm ? interpolate(t("permissions.deleteRealmConfirmation"), { realm: selectedRealm.realm }) : null}
         </Box>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={createUserVisible}
-        onDismiss={() => setCreateUserVisible(false)}
+      {createUserVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!userSubmitting) { setCreateUserVisible(false); setOperationError(""); setFieldErrors({}); setUserForm(EMPTY_USER_FORM); } }}
         header={t("permissions.createUserModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setCreateUserVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={userSubmitting} onClick={() => { setCreateUserVisible(false); setOperationError(""); setFieldErrors({}); setUserForm(EMPTY_USER_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={userSubmitting} onClick={() => void submitUser("create")}>{t("common.create")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.userId")}>
-            <Input value={userForm.userid} placeholder={t("permissions.userIdPlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, userid: detail.value }))} />
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["userid"]} label={t("permissions.userId")}>
+            <Input autoComplete="off" value={userForm.userid} placeholder={t("permissions.userIdPlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, userid: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.password")}>
-            <Input type="password" value={userForm.password} onChange={({ detail }) => setUserForm((current) => ({ ...current, password: detail.value }))} />
+          <FormField label={`${t("permissions.password")} — ${text("optional", "선택 사항")}`} description={text("Initial password for PVE accounts or existing PAM accounts. External directory users authenticate with their identity provider.", "PVE 계정 또는 기존 PAM 계정의 초기 비밀번호입니다. 외부 디렉터리 사용자는 해당 인증 제공자에서 인증합니다.")} constraintText={text("8 to 64 characters when provided.", "입력하는 경우 8~64자.")}>
+            <Input type="password" autoComplete="new-password" value={userForm.password} onChange={({ detail }) => setUserForm((current) => ({ ...current, password: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.groupsLabel")} description={t("permissions.groupsHelp")}>
-            <Input value={userForm.groups} placeholder={t("permissions.groupsPlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, groups: detail.value }))} />
+          <FormField errorText={fieldErrors["groups"]} label={t("permissions.groupsLabel")} description={text("Select the groups this user belongs to.", "사용자가 속할 그룹을 선택하세요.")}>
+            <Multiselect filteringType="auto" selectedOptions={toList(userForm.groups).map((value) => ({ label: value, value }))} options={groupOptions} placeholder={t("permissions.groupsPlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, groups: detail.selectedOptions.map((option) => option.value).join(",") }))} />
           </FormField>
-          <FormField label={t("permissions.email")}>
+          <FormField errorText={fieldErrors["email"]} label={t("permissions.email")}>
             <Input value={userForm.email} onChange={({ detail }) => setUserForm((current) => ({ ...current, email: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.firstName")}>
+          <FormField errorText={fieldErrors["firstname"]} label={t("permissions.firstName")}>
             <Input value={userForm.firstname} onChange={({ detail }) => setUserForm((current) => ({ ...current, firstname: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.lastName")}>
+          <FormField errorText={fieldErrors["lastname"]} label={t("permissions.lastName")}>
             <Input value={userForm.lastname} onChange={({ detail }) => setUserForm((current) => ({ ...current, lastname: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.expire")} description={t("permissions.expireHelp")}>
+          <FormField errorText={fieldErrors["expire"]} label={t("permissions.expire")} description={t("permissions.expireHelp")}>
             <Input value={userForm.expire} placeholder={t("permissions.expirePlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, expire: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.comment")}>
+          <FormField errorText={fieldErrors["comment"]} label={t("permissions.comment")}>
             <Textarea value={userForm.comment} onChange={({ detail }) => setUserForm((current) => ({ ...current, comment: detail.value }))} />
           </FormField>
           <Checkbox checked={userForm.enabled} onChange={({ detail }) => setUserForm((current) => ({ ...current, enabled: detail.checked }))}>
             {t("permissions.enabled")}
           </Checkbox>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={editUserVisible}
-        onDismiss={() => setEditUserVisible(false)}
+      {editUserVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!userSubmitting) { setEditUserVisible(false); setOperationError(""); setFieldErrors({}); setUserForm(EMPTY_USER_FORM); } }}
         header={t("permissions.editUserModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setEditUserVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={userSubmitting} onClick={() => { setEditUserVisible(false); setOperationError(""); setFieldErrors({}); setUserForm(EMPTY_USER_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={userSubmitting} onClick={() => void submitUser("edit")}>{t("common.save")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.userId")}>
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["userid"]} label={t("permissions.userId")}>
             <Input value={userForm.userid} disabled />
           </FormField>
-          <FormField label={t("permissions.password")} description={t("permissions.passwordOptionalHelp")}>
-            <Input type="password" value={userForm.password} onChange={({ detail }) => setUserForm((current) => ({ ...current, password: detail.value }))} />
+          <Alert type="info">{text("Change passwords and manage API tokens or two-factor authentication using the Security action on the user row.", "사용자 행의 보안 메뉴에서 비밀번호, API 토큰, 2단계 인증을 관리할 수 있습니다.")}</Alert>
+          <FormField errorText={fieldErrors["groups"]} label={t("permissions.groupsLabel")} description={text("Select the groups this user belongs to.", "사용자가 속할 그룹을 선택하세요.")}>
+            <Multiselect filteringType="auto" selectedOptions={toList(userForm.groups).map((value) => ({ label: value, value }))} options={groupOptions} placeholder={t("permissions.groupsPlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, groups: detail.selectedOptions.map((option) => option.value).join(",") }))} />
           </FormField>
-          <FormField label={t("permissions.groupsLabel")} description={t("permissions.groupsHelp")}>
-            <Input value={userForm.groups} placeholder={t("permissions.groupsPlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, groups: detail.value }))} />
-          </FormField>
-          <FormField label={t("permissions.email")}>
+          <FormField errorText={fieldErrors["email"]} label={t("permissions.email")}>
             <Input value={userForm.email} onChange={({ detail }) => setUserForm((current) => ({ ...current, email: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.firstName")}>
+          <FormField errorText={fieldErrors["firstname"]} label={t("permissions.firstName")}>
             <Input value={userForm.firstname} onChange={({ detail }) => setUserForm((current) => ({ ...current, firstname: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.lastName")}>
+          <FormField errorText={fieldErrors["lastname"]} label={t("permissions.lastName")}>
             <Input value={userForm.lastname} onChange={({ detail }) => setUserForm((current) => ({ ...current, lastname: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.expire")} description={t("permissions.expireHelp")}>
+          <FormField errorText={fieldErrors["expire"]} label={t("permissions.expire")} description={t("permissions.expireHelp")}>
             <Input value={userForm.expire} placeholder={t("permissions.expirePlaceholder")} onChange={({ detail }) => setUserForm((current) => ({ ...current, expire: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.comment")}>
+          <FormField errorText={fieldErrors["comment"]} label={t("permissions.comment")}>
             <Textarea value={userForm.comment} onChange={({ detail }) => setUserForm((current) => ({ ...current, comment: detail.value }))} />
           </FormField>
           <Checkbox checked={userForm.enabled} onChange={({ detail }) => setUserForm((current) => ({ ...current, enabled: detail.checked }))}>
             {t("permissions.enabled")}
           </Checkbox>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={deleteUserVisible}
-        onDismiss={() => setDeleteUserVisible(false)}
+      {deleteUserVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!userSubmitting) { setDeleteUserVisible(false); setOperationError(""); setFieldErrors({}); } }}
         header={t("permissions.deleteUserModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setDeleteUserVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={userSubmitting} onClick={() => { setDeleteUserVisible(false); setOperationError(""); setFieldErrors({}); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={userSubmitting} onClick={() => void deleteUser()}>{t("common.delete")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         <Box>{selectedUser ? interpolate(t("permissions.deleteUserConfirmation"), { userid: selectedUser.userid }) : null}</Box>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={createGroupVisible}
-        onDismiss={() => setCreateGroupVisible(false)}
+      {createGroupVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!groupSubmitting) { setCreateGroupVisible(false); setOperationError(""); setFieldErrors({}); setGroupForm(EMPTY_GROUP_FORM); } }}
         header={t("permissions.createGroupModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setCreateGroupVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={groupSubmitting} onClick={() => { setCreateGroupVisible(false); setOperationError(""); setFieldErrors({}); setGroupForm(EMPTY_GROUP_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={groupSubmitting} onClick={() => void submitGroup("create")}>{t("common.create")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.groupId")}>
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["groupid"]} label={t("permissions.groupId")}>
             <Input value={groupForm.groupid} onChange={({ detail }) => setGroupForm((current) => ({ ...current, groupid: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.comment")}>
+          <FormField errorText={fieldErrors["comment"]} label={t("permissions.comment")}>
             <Textarea value={groupForm.comment} onChange={({ detail }) => setGroupForm((current) => ({ ...current, comment: detail.value }))} />
           </FormField>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={editGroupVisible}
-        onDismiss={() => setEditGroupVisible(false)}
+      {editGroupVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!groupSubmitting) { setEditGroupVisible(false); setOperationError(""); setFieldErrors({}); setGroupForm(EMPTY_GROUP_FORM); } }}
         header={t("permissions.editGroupModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setEditGroupVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={groupSubmitting} onClick={() => { setEditGroupVisible(false); setOperationError(""); setFieldErrors({}); setGroupForm(EMPTY_GROUP_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={groupSubmitting} onClick={() => void submitGroup("edit")}>{t("common.save")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.groupId")}>
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["groupid"]} label={t("permissions.groupId")}>
             <Input value={groupForm.groupid} disabled />
           </FormField>
-          <FormField label={t("permissions.comment")}>
+          <FormField errorText={fieldErrors["comment"]} label={t("permissions.comment")}>
             <Textarea value={groupForm.comment} onChange={({ detail }) => setGroupForm((current) => ({ ...current, comment: detail.value }))} />
           </FormField>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={deleteGroupVisible}
-        onDismiss={() => setDeleteGroupVisible(false)}
+      {deleteGroupVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!groupSubmitting) { setDeleteGroupVisible(false); setOperationError(""); setFieldErrors({}); } }}
         header={t("permissions.deleteGroupModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setDeleteGroupVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={groupSubmitting} onClick={() => { setDeleteGroupVisible(false); setOperationError(""); setFieldErrors({}); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={groupSubmitting} onClick={() => void deleteGroup()}>{t("common.delete")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         <Box>{selectedGroup ? interpolate(t("permissions.deleteGroupConfirmation"), { groupid: selectedGroup.groupid }) : null}</Box>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={createRoleVisible}
-        onDismiss={() => setCreateRoleVisible(false)}
+      {createRoleVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!roleSubmitting) { setCreateRoleVisible(false); setOperationError(""); setFieldErrors({}); setRoleForm(EMPTY_ROLE_FORM); } }}
         header={t("permissions.createRoleModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setCreateRoleVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={roleSubmitting} onClick={() => { setCreateRoleVisible(false); setOperationError(""); setFieldErrors({}); setRoleForm(EMPTY_ROLE_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={roleSubmitting} onClick={() => void submitRole("create")}>{t("common.create")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.roleId")}>
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["roleid"]} label={t("permissions.roleId")}>
             <Input value={roleForm.roleid} onChange={({ detail }) => setRoleForm((current) => ({ ...current, roleid: detail.value }))} />
           </FormField>
-          <FormField label={t("permissions.privileges")} description={t("permissions.privilegesHelp")}>
-            <Textarea value={roleForm.privs} placeholder={t("permissions.privilegesPlaceholder")} onChange={({ detail }) => setRoleForm((current) => ({ ...current, privs: detail.value }))} />
+          <FormField errorText={fieldErrors["privs"]} label={t("permissions.privileges")} description={text("Select privileges reported by this Proxmox server. Leave empty to create a role without privileges.", "Proxmox 서버에서 제공하는 권한을 선택하세요. 비워 두면 권한 없는 역할을 생성합니다.")}>
+            <Multiselect filteringType="auto" selectedOptions={toList(roleForm.privs).map((value) => ({ label: value, value }))} options={[...new Set(roles.flatMap((role) => role.privs).concat(toList(roleForm.privs)))].sort().map((value) => ({ label: value, value }))} placeholder={t("permissions.privilegesPlaceholder")} onChange={({ detail }) => setRoleForm((current) => ({ ...current, privs: detail.selectedOptions.map((option) => option.value).join(",") }))} />
           </FormField>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={editRoleVisible}
-        onDismiss={() => setEditRoleVisible(false)}
+      {editRoleVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!roleSubmitting) { setEditRoleVisible(false); setOperationError(""); setFieldErrors({}); setRoleForm(EMPTY_ROLE_FORM); } }}
         header={t("permissions.editRoleModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setEditRoleVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={roleSubmitting} onClick={() => { setEditRoleVisible(false); setOperationError(""); setFieldErrors({}); setRoleForm(EMPTY_ROLE_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={roleSubmitting} onClick={() => void submitRole("edit")}>{t("common.save")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.roleId")}>
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["roleid"]} label={t("permissions.roleId")}>
             <Input value={roleForm.roleid} disabled />
           </FormField>
-          <FormField label={t("permissions.privileges")} description={t("permissions.privilegesHelp")}>
-            <Textarea value={roleForm.privs} placeholder={t("permissions.privilegesPlaceholder")} onChange={({ detail }) => setRoleForm((current) => ({ ...current, privs: detail.value }))} />
+          <FormField errorText={fieldErrors["privs"]} label={t("permissions.privileges")} description={text("Select privileges reported by this Proxmox server. Leave empty to create a role without privileges.", "Proxmox 서버에서 제공하는 권한을 선택하세요. 비워 두면 권한 없는 역할을 생성합니다.")}>
+            <Multiselect filteringType="auto" selectedOptions={toList(roleForm.privs).map((value) => ({ label: value, value }))} options={[...new Set(roles.flatMap((role) => role.privs).concat(toList(roleForm.privs)))].sort().map((value) => ({ label: value, value }))} placeholder={t("permissions.privilegesPlaceholder")} onChange={({ detail }) => setRoleForm((current) => ({ ...current, privs: detail.selectedOptions.map((option) => option.value).join(",") }))} />
           </FormField>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={deleteRoleVisible}
-        onDismiss={() => setDeleteRoleVisible(false)}
+      {deleteRoleVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!roleSubmitting) { setDeleteRoleVisible(false); setOperationError(""); setFieldErrors({}); } }}
         header={t("permissions.deleteRoleModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setDeleteRoleVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={roleSubmitting} onClick={() => { setDeleteRoleVisible(false); setOperationError(""); setFieldErrors({}); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={roleSubmitting} onClick={() => void deleteRole()}>{t("common.delete")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         <Box>{selectedRole ? interpolate(t("permissions.deleteRoleConfirmation"), { roleid: selectedRole.roleid }) : null}</Box>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={createAclVisible}
-        onDismiss={() => setCreateAclVisible(false)}
+      {createAclVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!aclSubmitting) { setCreateAclVisible(false); setOperationError(""); setFieldErrors({}); setAclForm(EMPTY_ACL_FORM); } }}
         header={t("permissions.addAclModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setCreateAclVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={aclSubmitting} onClick={() => { setCreateAclVisible(false); setOperationError(""); setFieldErrors({}); setAclForm(EMPTY_ACL_FORM); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={aclSubmitting} onClick={() => void submitAcl()}>{t("permissions.addAcl")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
-        <SpaceBetween size="m">
-          <FormField label={t("permissions.path")} description={t("permissions.pathHelp")}>
+        <SpaceBetween size="l">
+          {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
+          <FormField errorText={fieldErrors["path"]} label={t("permissions.path")} description={t("permissions.pathHelp")}>
             <Input value={aclForm.path} placeholder={t("permissions.pathPlaceholder")} onChange={({ detail }) => setAclForm((current) => ({ ...current, path: detail.value }))} />
           </FormField>
           <FormField label={t("permissions.subjectType")}>
@@ -2763,11 +2778,10 @@ export default function PermissionsPage() {
               ]}
               onChange={({ detail }) => {
                 const subjectType = (getTrackableId(detail.selectedOption) || "user") as AclFormState["subjectType"];
-                const nextOptions = subjectType === "group" ? groupOptions : subjectType === "token" ? tokenOptions : userOptions;
                 setAclForm((current) => ({
                   ...current,
                   subjectType,
-                  subjectId: typeof nextOptions[0]?.value === "string" ? nextOptions[0].value : "",
+                  subjectId: "",
                 }));
               }}
             />
@@ -2792,21 +2806,23 @@ export default function PermissionsPage() {
             {t("permissions.propagate")}
           </Checkbox>
         </SpaceBetween>
-      </Modal>
+      </Modal>}
 
-      <Modal
-        visible={deleteAclVisible}
-        onDismiss={() => setDeleteAclVisible(false)}
+      {deleteAclVisible && <Modal
+        visible
+        closeAriaLabel={text("Close dialog", "대화 상자 닫기")}
+        onDismiss={() => { if (!aclSubmitting) { setDeleteAclVisible(false); setOperationError(""); setFieldErrors({}); } }}
         header={t("permissions.removeAclModalTitle")}
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setDeleteAclVisible(false)}>{t("common.cancel")}</Button>
+              <Button disabled={aclSubmitting} onClick={() => { setDeleteAclVisible(false); setOperationError(""); setFieldErrors({}); }}>{t("common.cancel")}</Button>
               <Button variant="primary" loading={aclSubmitting} onClick={() => void deleteAcl()}>{t("common.delete")}</Button>
             </SpaceBetween>
           </Box>
         }
       >
+        {Boolean(operationError) && <Alert type="error">{operationError}</Alert>}
         <Box>
           {selectedAcl
             ? interpolate(t("permissions.removeAclConfirmation"), {
@@ -2816,7 +2832,7 @@ export default function PermissionsPage() {
               })
             : null}
         </Box>
-      </Modal>
+      </Modal>}
     </SpaceBetween>
   );
 }

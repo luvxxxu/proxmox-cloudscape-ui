@@ -1,5 +1,9 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
+import { collectResourceResults, formatResourceBytes as formatBytes, isStorageActive } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useCollection } from "@cloudscape-design/collection-hooks";
@@ -120,13 +124,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   ],
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
+
 
 function formatUsage(value?: number): number {
   if (value === undefined || Number.isNaN(value)) {
@@ -146,9 +144,7 @@ function optionValue(option: SelectProps.Option | null) {
   return typeof option?.value === "string" ? option.value : "";
 }
 
-function isStorageActive(storage: Pick<PveStorage, "active" | "status">) {
-  return storage.active === 1 || storage.status === "active";
-}
+
 
 function getSupportedContentTypes(type: StorageType | "") {
   if (type === "dir" || type === "nfs" || type === "cifs") {
@@ -236,22 +232,8 @@ function storageConfigToForm(config: PveStorageConfig, summary: PveStorage): Sto
   };
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T | string } | null;
-
-  if (!response.ok) {
-    const message = typeof json?.data === "string"
-      ? json.data
-      : interpolate(t("cluster.common.requestFailed"), { status: response.status });
-    throw new Error(message);
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function StoragePage() {
@@ -326,14 +308,15 @@ export default function StoragePage() {
       setLoading(true);
       const nodes = await fetchProxmox<PveNode[]>("/api/proxmox/nodes", t);
       const onlineNodes = (nodes ?? []).filter((node) => node.status === "online");
-      const storageLists = await Promise.all(
+      const storageLists = await Promise.allSettled(
         onlineNodes.map(async ({ node }) => {
           const entries = await fetchProxmox<Omit<PveStorage, "node">[]>(`/api/proxmox/nodes/${node}/storage`, t);
           return (entries ?? []).map((entry) => ({ ...entry, node }));
         }),
       );
-      setStorages(storageLists.flat());
-      setError(null);
+      const result = collectResourceResults(storageLists, onlineNodes.map((node) => node.node));
+      setStorages(result.values);
+      setError(result.errors.length ? result.errors.join("; ") : null);
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : t("storage.failedToLoad"));
     } finally {
@@ -341,7 +324,10 @@ export default function StoragePage() {
     }
   }, [t]);
 
+  useResourceTaskRefresh(loadStorages);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadStorages();
   }, [loadStorages]);
 
@@ -755,6 +741,7 @@ export default function StoragePage() {
         <Box variant="p" color="inherit">
           {t("storage.noStorageMatch")}
         </Box>
+        {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
         <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
       </SpaceBetween>
     </Box>

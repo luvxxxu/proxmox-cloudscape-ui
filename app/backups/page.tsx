@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -21,6 +23,7 @@ import Textarea from "@cloudscape-design/components/textarea";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import { useNotifications } from "@/app/components/notifications";
 import { useTranslation } from "@/app/lib/use-translation";
+import { collectResourceResults, buildRestoreParameters, inferBackupGuestType, isStorageActive, isValidVmid, formatResourceBytes as formatBytes } from "@/app/lib/resource-api";
 
 interface PveNode {
   node: string;
@@ -95,13 +98,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   ],
 };
 
-function formatBytes(bytes?: number): string {
-  if (!bytes) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB", "PB"];
-  const index = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, index)).toFixed(1)} ${sizes[index]}`;
-}
+
 
 function formatDateTime(timestamp?: number): string {
   if (!timestamp) {
@@ -133,20 +130,6 @@ function hasStorageContent(storage: Pick<PveStorage, "content">, type: string) {
   return parseStorageContent(storage.content).includes(type);
 }
 
-function isStorageActive(storage: Pick<PveStorage, "active" | "status">) {
-  return storage.active === 1 || storage.status === "active" || storage.status === undefined;
-}
-
-function inferGuestType(volid: string): GuestType {
-  if (volid.includes("vzdump-qemu-")) {
-    return "qemu";
-  }
-  if (volid.includes("vzdump-lxc-")) {
-    return "lxc";
-  }
-  return "unknown";
-}
-
 function inferBackupFormat(volid: string, format?: string) {
   if (format) {
     return format;
@@ -156,22 +139,8 @@ function inferBackupFormat(volid: string, format?: string) {
   return parts.length > 1 ? parts[parts.length - 1] : "-";
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T } | null;
-
-  if (!response.ok) {
-    const message = typeof json?.data === "string"
-      ? json.data
-      : interpolate(t("backups.requestFailed"), { status: response.status });
-    throw new Error(message);
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function BackupsPage() {
@@ -188,15 +157,15 @@ export default function BackupsPage() {
   const [createVisible, setCreateVisible] = useState(false);
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [selectedResource, setSelectedResource] = useState<SelectProps.Option | null>(null);
-  const [selectedBackupStorage, setSelectedBackupStorage] = useState<SelectProps.Option | null>(null);
-  const [selectedCompression, setSelectedCompression] = useState<SelectProps.Option | null>(null);
-  const [selectedBackupMode, setSelectedBackupMode] = useState<SelectProps.Option | null>(null);
+  const [backupStorageSelection, setSelectedBackupStorage] = useState<SelectProps.Option | null>(null);
+  const [compressionSelection, setSelectedCompression] = useState<SelectProps.Option | null>(null);
+  const [backupModeSelection, setSelectedBackupMode] = useState<SelectProps.Option | null>(null);
   const [backupNotes, setBackupNotes] = useState("");
 
   const [restoreVisible, setRestoreVisible] = useState(false);
   const [restoreSubmitting, setRestoreSubmitting] = useState(false);
   const [backupToRestore, setBackupToRestore] = useState<BackupRow | null>(null);
-  const [selectedRestoreStorage, setSelectedRestoreStorage] = useState<SelectProps.Option | null>(null);
+  const [restoreStorageSelection, setSelectedRestoreStorage] = useState<SelectProps.Option | null>(null);
   const [restoreVmid, setRestoreVmid] = useState("");
 
   const [deleteVisible, setDeleteVisible] = useState(false);
@@ -223,7 +192,7 @@ export default function BackupsPage() {
 
       const [clusterResources, nodeStorages] = await Promise.all([
         fetchProxmox<ClusterResource[]>("/api/proxmox/cluster/resources?type=vm", t),
-        Promise.all(
+        Promise.allSettled(
           onlineNodes.map(async ({ node }) => {
             const entries = await fetchProxmox<Omit<PveStorage, "node">[]>(`/api/proxmox/nodes/${node}/storage`, t);
             return (entries ?? []).map((entry) => ({ ...entry, node }));
@@ -231,12 +200,13 @@ export default function BackupsPage() {
         ),
       ]);
 
-      const mergedStorages = nodeStorages.flat();
+      const storageResult = collectResourceResults(nodeStorages, onlineNodes.map((node) => node.node));
+      const mergedStorages = storageResult.values;
       const backupStorages = mergedStorages.filter(
         (storage) => isStorageActive(storage) && hasStorageContent(storage, "backup"),
       );
 
-      const backupLists = await Promise.all(
+      const backupLists = await Promise.allSettled(
         backupStorages.map(async ({ node, storage }) => {
           const entries = await fetchProxmox<PveBackupContent[]>(
             `/api/proxmox/nodes/${node}/storage/${storage}/content?content=backup`,
@@ -244,7 +214,7 @@ export default function BackupsPage() {
           );
 
           return (entries ?? [])
-            .filter((entry) => entry.content === "backup" || entry.volid.includes("vzdump-"))
+            .filter((entry) => entry.content === "backup" || inferBackupGuestType(entry.volid) !== "unknown")
             .map((entry) => ({
               id: `${node}:${storage}:${entry.volid}`,
               volid: entry.volid,
@@ -255,7 +225,7 @@ export default function BackupsPage() {
               ctime: entry.ctime,
               format: inferBackupFormat(entry.volid, entry.format),
               notes: entry.notes,
-              guestType: inferGuestType(entry.volid),
+              guestType: inferBackupGuestType(entry.volid),
             } satisfies BackupRow));
         }),
       );
@@ -266,8 +236,10 @@ export default function BackupsPage() {
           .sort((a, b) => (a.vmid ?? 0) - (b.vmid ?? 0)),
       );
       setStorages(mergedStorages);
-      setBackups(backupLists.flat().sort((a, b) => (b.ctime ?? 0) - (a.ctime ?? 0)));
-      setError(null);
+      const backupResult = collectResourceResults(backupLists, backupStorages.map((storage) => `${storage.node}/${storage.storage}`));
+      setBackups(backupResult.values.sort((a, b) => (b.ctime ?? 0) - (a.ctime ?? 0)));
+      const failures = [...storageResult.errors, ...backupResult.errors];
+      setError(failures.length ? failures.join("; ") : null);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : t("backups.failedToLoad"));
     } finally {
@@ -275,7 +247,10 @@ export default function BackupsPage() {
     }
   }, [t]);
 
+  useResourceTaskRefresh(loadData);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadData();
   }, [loadData]);
 
@@ -311,19 +286,8 @@ export default function BackupsPage() {
     [t],
   );
 
-  useEffect(() => {
-    if (!createVisible) {
-      return;
-    }
-
-    if (!selectedCompression) {
-      setSelectedCompression(compressionOptions[3] ?? compressionOptions[0] ?? null);
-    }
-
-    if (!selectedBackupMode) {
-      setSelectedBackupMode(backupModeOptions[0] ?? null);
-    }
-  }, [backupModeOptions, compressionOptions, createVisible, selectedBackupMode, selectedCompression]);
+  const selectedCompression = compressionOptions.find((option) => option.value === compressionSelection?.value) ?? compressionOptions[3] ?? null;
+  const selectedBackupMode = backupModeOptions.find((option) => option.value === backupModeSelection?.value) ?? backupModeOptions[0] ?? null;
 
   const selectedResourceData = useMemo(() => {
     const value = optionValue(selectedResource);
@@ -355,20 +319,7 @@ export default function BackupsPage() {
       }));
   }, [selectedResourceData, storages]);
 
-  useEffect(() => {
-    if (!createVisible) {
-      return;
-    }
-
-    const currentStorage = optionValue(selectedBackupStorage);
-    const hasCurrent = createStorageOptions.some((option) => option.value === currentStorage);
-
-    if (hasCurrent) {
-      return;
-    }
-
-    setSelectedBackupStorage(createStorageOptions[0] ?? null);
-  }, [createStorageOptions, createVisible, selectedBackupStorage]);
+  const selectedBackupStorage = createStorageOptions.find((option) => option.value === backupStorageSelection?.value) ?? createStorageOptions[0] ?? null;
 
   const restoreStorageOptions = useMemo<SelectProps.Option[]>(() => {
     if (!backupToRestore) {
@@ -379,9 +330,7 @@ export default function BackupsPage() {
     const matching = storages.filter(
       (storage) => storage.node === backupToRestore.node && isStorageActive(storage) && hasStorageContent(storage, preferredContent),
     );
-    const optionsSource = matching.length > 0
-      ? matching
-      : storages.filter((storage) => storage.node === backupToRestore.node && isStorageActive(storage));
+    const optionsSource = matching;
 
     return optionsSource
       .sort((a, b) => a.storage.localeCompare(b.storage))
@@ -392,20 +341,7 @@ export default function BackupsPage() {
       }));
   }, [backupToRestore, storages]);
 
-  useEffect(() => {
-    if (!restoreVisible) {
-      return;
-    }
-
-    const currentStorage = optionValue(selectedRestoreStorage);
-    const hasCurrent = restoreStorageOptions.some((option) => option.value === currentStorage);
-
-    if (hasCurrent) {
-      return;
-    }
-
-    setSelectedRestoreStorage(restoreStorageOptions[0] ?? null);
-  }, [restoreStorageOptions, restoreVisible, selectedRestoreStorage]);
+  const selectedRestoreStorage = restoreStorageOptions.find((option) => option.value === restoreStorageSelection?.value) ?? restoreStorageOptions[0] ?? null;
 
   const guestTypeLabel = useCallback((guestType: GuestType) => {
     if (guestType === "qemu") return t("backups.virtualMachine");
@@ -551,7 +487,7 @@ export default function BackupsPage() {
     }
 
     const nextVmid = restoreVmid.trim() || String(backupToRestore.vmid);
-    if (!/^\d+$/.test(nextVmid)) {
+    if (!isValidVmid(nextVmid)) {
       addFlash({
         id: "backups-restore-vmid-error",
         type: "error",
@@ -582,11 +518,7 @@ export default function BackupsPage() {
     try {
       setRestoreSubmitting(true);
 
-      const body = new URLSearchParams({
-        vmid: nextVmid,
-        archive: backupToRestore.volid,
-        storage,
-      });
+      const body = buildRestoreParameters(backupToRestore.guestType, nextVmid, backupToRestore.volid, storage);
 
       const upid = await fetchProxmox<string>(path, t, {
         method: "POST",
@@ -821,6 +753,7 @@ export default function BackupsPage() {
             <Box variant="p" color="inherit">
               {t("backups.noBackupsMatch")}
             </Box>
+            {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
             <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
           </SpaceBetween>
         </Box>
@@ -841,7 +774,7 @@ export default function BackupsPage() {
 
   return (
     <SpaceBetween size="m">
-      {flashItems.length > 0 ? <Flashbar items={flashItems} /> : null}
+      {flashItems.length > 0 ? <Flashbar items={flashItems.map((item) => ({ ...item, onDismiss: item.onDismiss ?? (() => dismissFlash(item.id ?? "")) }))} /> : null}
       {error ? (
         <Alert type="error" header={t("backups.failedToLoad")}>
           {error}

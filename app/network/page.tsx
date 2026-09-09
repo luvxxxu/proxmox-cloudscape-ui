@@ -1,5 +1,7 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import Alert from "@cloudscape-design/components/alert";
@@ -21,6 +23,7 @@ import TextFilter from "@cloudscape-design/components/text-filter";
 import Textarea from "@cloudscape-design/components/textarea";
 import Toggle from "@cloudscape-design/components/toggle";
 import { useTranslation } from "@/app/lib/use-translation";
+import { collectResourceResults, formatNetworkCidr as formatAddressCidr, parseNetworkIpv4 as parseIpv4Cidr } from "@/app/lib/resource-api";
 
 interface PveNode {
   node: string;
@@ -55,7 +58,7 @@ interface Preferences {
   contentDisplay: ReadonlyArray<CollectionPreferencesProps.ContentDisplayItem>;
 }
 
-type NetworkFormType = "bridge" | "bond" | "vlan";
+type NetworkFormType = string;
 
 interface NetworkFormState {
   node: string;
@@ -127,22 +130,7 @@ function interpolate(template: string, values: Record<string, string | number>) 
   );
 }
 
-function getMessage(responseData: unknown, fallback: string) {
-  if (typeof responseData === "string" && responseData.trim()) {
-    return responseData;
-  }
 
-  if (
-    typeof responseData === "object"
-    && responseData !== null
-    && "message" in responseData
-    && typeof responseData.message === "string"
-  ) {
-    return responseData.message;
-  }
-
-  return fallback;
-}
 
 function getOptionValue(option: SelectProps.Option | null) {
   return typeof option?.value === "string" ? option.value : "";
@@ -157,27 +145,6 @@ function encodeFormBody(params: URLSearchParams) {
   };
 }
 
-function normalizeType(type?: string): NetworkFormType {
-  const value = (type ?? "").toLowerCase();
-  if (value.includes("bond")) {
-    return "bond";
-  }
-  if (value.includes("vlan")) {
-    return "vlan";
-  }
-  return "bridge";
-}
-
-function formatAddressCidr(network: PveNetwork) {
-  const address = network.address?.trim();
-  if (!address) {
-    return "";
-  }
-
-  const suffix = network.cidr ?? network.netmask;
-  return suffix ? `${address}/${suffix}` : address;
-}
-
 function buildFormState(network?: PveNetwork): NetworkFormState {
   if (!network) {
     return EMPTY_FORM;
@@ -186,7 +153,7 @@ function buildFormState(network?: PveNetwork): NetworkFormState {
   return {
     node: network.node,
     iface: network.iface,
-    type: normalizeType(network.type),
+    type: network.type,
     ipv4Cidr: formatAddressCidr(network),
     gateway: network.gateway ?? "",
     autostart: network.autostart === 1,
@@ -199,32 +166,6 @@ function buildFormState(network?: PveNetwork): NetworkFormState {
   };
 }
 
-function cidrToNetmask(cidr: string): string {
-  const bits = parseInt(cidr, 10);
-  if (isNaN(bits) || bits < 0 || bits > 32) return cidr;
-  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
-  return [
-    (mask >>> 24) & 255,
-    (mask >>> 16) & 255,
-    (mask >>> 8) & 255,
-    mask & 255,
-  ].join(".");
-}
-
-function parseIpv4Cidr(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return { address: "", netmask: "" };
-  }
-
-  const [addressPart, maskPart] = trimmed.split("/");
-  const rawMask = maskPart?.trim() ?? "";
-  return {
-    address: addressPart?.trim() ?? "",
-    netmask: rawMask.includes(".") ? rawMask : cidrToNetmask(rawMask),
-  };
-}
-
 function appendDeleteFields(params: URLSearchParams, deleteFields: string[]) {
   if (deleteFields.length > 0) {
     params.set("delete", deleteFields.join(","));
@@ -232,30 +173,20 @@ function appendDeleteFields(params: URLSearchParams, deleteFields: string[]) {
 }
 
 function getTypeLabel(type: string, t: (key: string) => string) {
-  switch (normalizeType(type)) {
+  switch (type) {
     case "bond":
       return t("network.linuxBond");
     case "vlan":
       return t("network.linuxVlan");
     case "bridge":
-    default:
       return t("network.linuxBridge");
+    default:
+      return type;
   }
 }
 
-async function fetchProxmox<T>(path: string, t: (key: string) => string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T; message?: string } | null;
-
-  if (!response.ok) {
-    throw new Error(getMessage(json?.data ?? json?.message, interpolate(t("network.requestFailed"), { status: response.status })));
-  }
-
-  return json?.data as T;
+async function fetchProxmox<T>(path: string, _t: (key: string) => string, init?: RequestInit): Promise<T> {
+  return requestResource<T>(path, init);
 }
 
 export default function NetworkPage() {
@@ -289,15 +220,16 @@ export default function NetworkPage() {
       setLoading(true);
       const nextNodes = await fetchProxmox<PveNode[]>("/api/proxmox/nodes", t);
       const onlineNodes = (nextNodes ?? []).filter((node) => node.status === "online");
-      const networkLists = await Promise.all(
+      const networkLists = await Promise.allSettled(
         onlineNodes.map(async ({ node }) => {
           const entries = await fetchProxmox<Omit<PveNetwork, "node">[]>(`/api/proxmox/nodes/${node}/network`, t);
           return (entries ?? []).map((entry) => ({ ...entry, node }));
         }),
       );
       setNodes(onlineNodes);
-      setInterfaces(networkLists.flat());
-      setError(null);
+      const result = collectResourceResults(networkLists, onlineNodes.map((node) => node.node));
+      setInterfaces(result.values);
+      setError(result.errors.length ? result.errors.join("; ") : null);
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : t("network.failedToLoad"));
     } finally {
@@ -305,7 +237,10 @@ export default function NetworkPage() {
     }
   }, [t]);
 
+  useResourceTaskRefresh(loadInterfaces);
+
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadInterfaces();
   }, [loadInterfaces]);
 
@@ -468,6 +403,7 @@ export default function NetworkPage() {
             <Box variant="p" color="inherit">
               {t("network.noInterfacesMatch")}
             </Box>
+            {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
             <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
           </SpaceBetween>
         </Box>
@@ -545,7 +481,7 @@ export default function NetworkPage() {
     if (iface) {
       params.set("iface", iface);
     }
-    params.set("type", formState.type);
+    if (mode === "create") params.set("type", formState.type);
     params.set("autostart", formState.autostart ? "1" : "0");
 
     if (address) {
@@ -745,7 +681,7 @@ export default function NetworkPage() {
 
   const headerCounter = filterProps.filteringText ? `(${filteredItemsCount}/${interfaces.length})` : `(${interfaces.length})`;
 
-  const selectedTypeOption = typeOptions.find((option) => option.value === formState.type) ?? null;
+  const selectedTypeOption = typeOptions.find((option) => option.value === formState.type) ?? { label: formState.type, value: formState.type };
   const selectedNodeOption = nodeOptions.find((option) => option.value === formState.node) ?? null;
   const selectedBondModeOption = bondModeOptions.find((option) => option.value === formState.bondMode) ?? null;
 

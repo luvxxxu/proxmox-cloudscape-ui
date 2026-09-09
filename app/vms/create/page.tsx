@@ -1,5 +1,8 @@
 "use client";
 
+import { requestResource } from "@/app/lib/resource-request";
+import { isStorageActive, isValidVmid, isIntegerInRange } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
@@ -19,10 +22,6 @@ import Toggle from "@cloudscape-design/components/toggle";
 import Wizard, { type WizardProps } from "@cloudscape-design/components/wizard";
 import { useTranslation } from "@/app/lib/use-translation";
 
-interface ProxmoxResponse<T> {
-  data: T;
-}
-
 interface NodeSummary {
   node: string;
   status: string;
@@ -35,6 +34,8 @@ interface ClusterNextId {
 interface StorageSummary {
   storage: string;
   content?: string;
+  active?: number;
+  enabled?: number;
 }
 
 interface StorageContentItem {
@@ -129,22 +130,7 @@ const AGENT_TYPE_OPTIONS: ReadonlyArray<SelectProps.Option> = [
 ];
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as ProxmoxResponse<T> | null;
-
-  if (!response.ok) {
-    const errorMessage =
-      typeof json?.data === "string"
-        ? json.data
-        : `Request failed with status ${response.status}`;
-    throw new Error(errorMessage);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path, init);
 }
 
 function optionLabel(option: SelectProps.Option | null) {
@@ -156,7 +142,7 @@ function optionValue(option: SelectProps.Option | null) {
 }
 
 function storageSupportsContent(storage: StorageSummary, contentType: string) {
-  return (storage.content ?? "")
+  return isStorageActive(storage) && (storage.content ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .includes(contentType);
@@ -199,12 +185,12 @@ export default function CreateVirtualMachinePage() {
   const [sockets, setSockets] = useState("1");
   const [selectedCpuType, setSelectedCpuType] = useState<SelectProps.Option | null>(CPU_TYPE_OPTIONS[0] ?? null);
   const [numaEnabled, setNumaEnabled] = useState(true);
-  const [cpuFlagAes, setCpuFlagAes] = useState(true);
-  const [cpuFlagPcid, setCpuFlagPcid] = useState(true);
-  const [cpuFlagSpecCtrl, setCpuFlagSpecCtrl] = useState(true);
-  const [cpuFlagIbpb, setCpuFlagIbpb] = useState(true);
-  const [cpuFlagSsbd, setCpuFlagSsbd] = useState(true);
-  const [cpuFlagMdClear, setCpuFlagMdClear] = useState(true);
+  const [cpuFlagAes, setCpuFlagAes] = useState(false);
+  const [cpuFlagPcid, setCpuFlagPcid] = useState(false);
+  const [cpuFlagSpecCtrl, setCpuFlagSpecCtrl] = useState(false);
+  const [cpuFlagIbpb, setCpuFlagIbpb] = useState(false);
+  const [cpuFlagSsbd, setCpuFlagSsbd] = useState(false);
+  const [cpuFlagMdClear, setCpuFlagMdClear] = useState(false);
 
   const [memory, setMemory] = useState("4096");
   const [ballooningEnabled, setBallooningEnabled] = useState(true);
@@ -243,14 +229,6 @@ export default function CreateVirtualMachinePage() {
   const [tags, setTags] = useState("");
   const [description, setDescription] = useState("");
 
-  useEffect(() => {
-    if (optionValue(selectedBios) === "ovmf") {
-      setEfiDiskEnabled(true);
-      return;
-    }
-
-    setEfiDiskEnabled(false);
-  }, [selectedBios]);
 
   const yesNo = useCallback(
     (value: boolean) => (value ? t("common.yes") : t("common.no")),
@@ -309,21 +287,14 @@ export default function CreateVirtualMachinePage() {
   }, [t]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadInitialData();
   }, [loadInitialData]);
 
   useEffect(() => {
     const node = optionValue(selectedNode);
 
-    if (!node) {
-      setIsoOptions([]);
-      setSelectedIso(null);
-      setStorageOptions([]);
-      setSelectedStorage(null);
-      setBridgeOptions([]);
-      setSelectedBridge(null);
-      return;
-    }
+    if (!node) return;
 
     let cancelled = false;
 
@@ -370,7 +341,7 @@ export default function CreateVirtualMachinePage() {
         });
 
         const networkBridgeOptions = (networks ?? [])
-          .filter((network) => network.type === "bridge")
+          .filter((network) => network.type === "bridge" || network.type === "OVSBridge")
           .map((network) => ({ label: network.iface, value: network.iface }))
           .sort((left, right) => optionLabel(left).localeCompare(optionLabel(right)));
 
@@ -414,32 +385,35 @@ export default function CreateVirtualMachinePage() {
   }, [selectedNode, t]);
 
   const validateForm = useCallback((): ValidationResult | null => {
+    if (nodeResourcesLoading) return { message: "Wait for node resources to finish loading.", stepIndex: 0 };
     if (!vmName.trim()) {
       return { message: t("vms.vmNameRequired"), stepIndex: 0 };
     }
     if (!optionValue(selectedNode)) {
       return { message: t("vms.nodeRequired"), stepIndex: 0 };
     }
-    if (!vmId.trim()) {
+    if (!isValidVmid(vmId)) {
       return { message: t("vms.vmIdRequired"), stepIndex: 0 };
     }
     if (!optionValue(selectedStorage)) {
       return { message: t("vms.storageRequired"), stepIndex: 5 };
     }
     if (!optionValue(selectedBridge)) {
-      return { message: t("vms.bridgeRequired"), stepIndex: 5 };
+      return { message: t("vms.bridgeRequired"), stepIndex: 6 };
     }
-    if (Number(cores) <= 0 || Number(sockets) <= 0 || Number(memory) <= 0) {
+    if (!isIntegerInRange(cores, 1) || !isIntegerInRange(sockets, 1)) {
       return { message: t("vms.coresSocketsMemoryError"), stepIndex: 3 };
     }
-    if (Number(diskSize) <= 0) {
+    if (!isIntegerInRange(memory, 16)) return { message: t("vms.coresSocketsMemoryError"), stepIndex: 4 };
+    if (!Number.isFinite(Number(diskSize)) || Number(diskSize) <= 0) {
       return { message: t("vms.diskSizeError"), stepIndex: 5 };
     }
-    if (ballooningEnabled && Number(minimumMemory) <= 0) {
+    if (ballooningEnabled && !isIntegerInRange(minimumMemory, 16, Number(memory))) {
       return { message: t("vms.minimumMemoryError"), stepIndex: 4 };
     }
     return null;
   }, [
+    nodeResourcesLoading,
     ballooningEnabled,
     cores,
     diskSize,
@@ -532,7 +506,10 @@ export default function CreateVirtualMachinePage() {
 
     if (isoVolid) {
       body.set("ide2", `${isoVolid},media=cdrom`);
+    } else {
+      body.set("ide2", "none,media=cdrom");
     }
+    if (optionValue(selectedVgaType) === "serial0") body.set("serial0", "socket");
     if (efiDiskEnabled) {
       body.set("efidisk0", `${storage}:1,format=${diskFormat},efitype=4m,pre-enrolled-keys=1`);
     }
@@ -553,7 +530,7 @@ export default function CreateVirtualMachinePage() {
       setSubmitting(true);
       setError(null);
 
-      const response = await fetch(`/api/proxmox/nodes/${node}/qemu`, {
+      await requestResource<string>(`/api/proxmox/nodes/${node}/qemu`, {
         method: "POST",
         cache: "no-store",
         headers: {
@@ -561,16 +538,6 @@ export default function CreateVirtualMachinePage() {
         },
         body: body.toString(),
       });
-
-      const json = (await response.json().catch(() => null)) as ProxmoxResponse<unknown> | null;
-
-      if (!response.ok) {
-        const errorMessage =
-          typeof json?.data === "string"
-            ? json.data
-            : `Request failed with status ${response.status}`;
-        throw new Error(errorMessage);
-      }
 
       setFlashbarItems([
         {
@@ -581,9 +548,7 @@ export default function CreateVirtualMachinePage() {
         },
       ]);
 
-      window.setTimeout(() => {
-        router.push("/vms");
-      }, 2000);
+      router.push("/vms");
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : t("vms.failedToCreate"));
     } finally {
@@ -794,7 +759,7 @@ export default function CreateVirtualMachinePage() {
               <FormField label={t("vms.node")} description={t("vms.nodeDesc")} stretch>
                 <Select
                   selectedOption={selectedNode}
-                  onChange={({ detail }) => setSelectedNode(detail.selectedOption)}
+                  onChange={({ detail }) => { setSelectedNode(detail.selectedOption); setNodeResourcesLoading(false); setIsoOptions([]); setSelectedIso(null); setStorageOptions([]); setSelectedStorage(null); setBridgeOptions([]); setSelectedBridge(null); }}
                   options={nodeOptions}
                   placeholder={t("vms.chooseNode")}
                   loadingText={t("storage.loadingNodes")}
@@ -848,7 +813,7 @@ export default function CreateVirtualMachinePage() {
           <Container header={<Header variant="h2">{t("vms.systemSettings")}</Header>}>
             <ColumnLayout columns={2} variant="text-grid">
               <FormField label={t("vms.bios")} stretch>
-                <Select selectedOption={selectedBios} onChange={({ detail }) => setSelectedBios(detail.selectedOption)} options={BIOS_OPTIONS} />
+                <Select selectedOption={selectedBios} onChange={({ detail }) => { setSelectedBios(detail.selectedOption); setEfiDiskEnabled(optionValue(detail.selectedOption) === "ovmf"); }} options={BIOS_OPTIONS} />
               </FormField>
               <FormField label={t("vms.machineType")} description={t("vms.machineTypeDesc")} stretch>
                 <Select
@@ -1161,7 +1126,6 @@ export default function CreateVirtualMachinePage() {
       },
     ],
     [
-      activeStepIndex,
       agentFstrimEnabled,
       ballooningEnabled,
       bootOrder,
@@ -1226,7 +1190,7 @@ export default function CreateVirtualMachinePage() {
   return (
     <SpaceBetween size="l">
       <Header variant="h1">{t("vms.launchInstance")}</Header>
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry.id !== item.id))) }))} /> : null}
       {error ? (
         <Alert type="error" header={t("vms.unableToCreate")}>
           {error}
@@ -1252,7 +1216,7 @@ export default function CreateVirtualMachinePage() {
             collapsedStepsLabel: (n, total) =>
               t("vms.collapsedStepsLabel").replace("{n}", String(n)).replace("{total}", String(total)),
           }}
-          isLoadingNextStep={submitting}
+          isLoadingNextStep={submitting || nodeResourcesLoading}
         />
       )}
     </SpaceBetween>

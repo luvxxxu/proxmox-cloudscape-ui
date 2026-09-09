@@ -1,5 +1,11 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+import { GuestPowerConfirmation, type GuestPowerAction } from "@/app/lib/guest-power-confirmation";
+import { useSettings } from "@/app/components/settings-context";
+
+import { formatResourceBytes as formatBytes } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import { useRouter } from "next/navigation";
@@ -21,13 +27,9 @@ import TextFilter from "@cloudscape-design/components/text-filter";
 import type { CollectionPreferencesProps } from "@cloudscape-design/components/collection-preferences";
 import { useTranslation } from "@/app/lib/use-translation";
 
-interface PveNode {
-  node: string;
-  status: "online" | "offline" | "unknown";
-}
-
 interface PveContainer {
   vmid: number;
+  template?: number;
   name?: string;
   status: "running" | "stopped";
   node: string;
@@ -64,13 +66,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   ],
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
+
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
@@ -101,29 +97,19 @@ function interpolate(template: string, values: Record<string, string | number>) 
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
-  }
-  const json = (await response.json()) as { data?: T };
-  return json.data as T;
+  return requestResource<T>(path, init);
 }
 
 export default function ContainersPage() {
   const router = useRouter();
+  const { confirmPowerActions } = useSettings();
+  const [pendingPowerAction, setPendingPowerAction] = useState<GuestPowerAction | null>(null);
   const { t } = useTranslation();
   const { addError, trackTask } = useNotifications();
   const [containers, setContainers] = useState<PveContainer[]>([]);
   const [selectedItems, setSelectedItems] = useState<PveContainer[]>([]);
   const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState<"start" | "stop" | "reboot" | "delete" | null>(null);
+  const [actionLoading, setActionLoading] = useState<GuestPowerAction | "delete" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -132,18 +118,9 @@ export default function ContainersPage() {
   const loadContainers = useCallback(async () => {
     try {
       setLoading(true);
-      const nodes = await fetchProxmox<PveNode[]>("/api/proxmox/nodes");
-      const onlineNodes = (nodes ?? []).filter(({ status }) => status === "online");
-      const containersByNode = await Promise.all(
-        onlineNodes.map(async ({ node }) => {
-          const nodeContainers = await fetchProxmox<Omit<PveContainer, "node">[]>(`/api/proxmox/nodes/${node}/lxc`);
-          return (nodeContainers ?? []).map((container) => ({
-            ...container,
-            node,
-          }));
-        }),
-      );
-      const merged = containersByNode.flat().sort((a, b) => a.vmid - b.vmid);
+      const resources = await fetchProxmox<Array<PveContainer & { type: string }>>("/api/proxmox/cluster/resources?type=vm");
+      const merged = (resources ?? []).filter((guest) => guest.type === "lxc").sort((a, b) => a.vmid - b.vmid);
+
       setContainers(merged);
       setSelectedItems((current) => {
         const vmids = new Set(merged.map((container) => container.vmid));
@@ -157,82 +134,46 @@ export default function ContainersPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
+
+  useResourceTaskRefresh(loadContainers);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadContainers();
   }, [loadContainers]);
 
   const hasSelection = selectedItems.length > 0;
   const allStopped = hasSelection && selectedItems.every((container) => container.status === "stopped");
   const allRunning = hasSelection && selectedItems.every((container) => container.status === "running");
-  const canStart = allStopped && !actionLoading;
+  const canStart = allStopped && selectedItems.every((guest) => guest.template !== 1) && !actionLoading;
   const canStop = allRunning && !actionLoading;
   const canReboot = allRunning && !actionLoading;
   const canDelete = allStopped && !actionLoading;
   const canOpenConsole = selectedItems.length === 1 && selectedItems[0]?.status === "running" && !actionLoading;
 
-  const runPowerAction = useCallback(
-    async (action: "start" | "stop" | "reboot") => {
-      if (selectedItems.length === 0) return;
-      const expectedStatus = action === "stop" ? "stopped" : "running";
-      const targetVmids = new Set(selectedItems.map((container) => container.vmid));
-      try {
-        setActionLoading(action);
+  const runPowerAction = useCallback(async (action: GuestPowerAction) => {
+    if (!selectedItems.length) return;
+    setActionLoading(action);
+    const results = await Promise.allSettled(selectedItems.map(async (container) => {
+      const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${encodeURIComponent(container.node)}/lxc/${container.vmid}/status/${action}`, { method: "POST" });
+      if (upid) trackTask(upid, container.node, `${action} ${container.vmid}`);
+    }));
+    const failures = results.flatMap((result, index) => result.status === "rejected" ? [`${selectedItems[index].vmid}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`] : []);
+    if (failures.length) addError(failures.join("; "));
+    setPendingPowerAction(null);
+    await loadContainers();
+    setActionLoading(null);
+  }, [selectedItems, trackTask, addError, loadContainers]);
 
-        const results = await Promise.all(
-          selectedItems.map(async (container) => {
-            const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${container.node}/lxc/${container.vmid}/status/${action}`, {
-              method: "POST",
-              body: JSON.stringify({}),
-            });
-            return { container, upid };
-          }),
-        );
-
-        for (const { container, upid } of results) {
-          if (upid) {
-            trackTask(upid, container.node, `${action} container ${container.vmid} (${container.name ?? "unnamed"})`);
-          }
-        }
-
-        for (let i = 0; i < 10; i++) {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          const nodes = await fetchProxmox<PveNode[]>("/api/proxmox/nodes");
-          const onlineNodes = (nodes ?? []).filter((node) => node.status === "online");
-          const containersByNode = await Promise.all(
-            onlineNodes.map(async ({ node }) => {
-              const nodeContainers = await fetchProxmox<Omit<PveContainer, "node">[]>(`/api/proxmox/nodes/${node}/lxc`);
-              return (nodeContainers ?? []).map((container) => ({ ...container, node }));
-            }),
-          );
-          const freshContainers = containersByNode.flat().sort((a, b) => a.vmid - b.vmid);
-          const allTransitioned = freshContainers
-            .filter((container) => targetVmids.has(container.vmid))
-            .every((container) => action === "reboot" ? container.status === "running" : container.status === expectedStatus);
-
-          setContainers(freshContainers);
-          setSelectedItems((current) => {
-            const vmids = new Set(freshContainers.map((container) => container.vmid));
-            return current
-              .filter((container) => vmids.has(container.vmid))
-              .map((container) => freshContainers.find((item) => item.vmid === container.vmid) ?? container);
-          });
-
-          if (allTransitioned) break;
-        }
-      } catch (actionError) {
-        addError(actionError instanceof Error ? actionError.message : interpolate(t("containers.failedAction"), { action }));
-      } finally {
-        setActionLoading(null);
-      }
-    },
-    [selectedItems, trackTask, addError, t],
-  );
+  const requestPowerAction = (action: GuestPowerAction) => {
+    if (!confirmPowerActions && action !== "stop") void runPowerAction(action);
+    else setPendingPowerAction(action);
+  };
 
   const deleteConfirmPhrase = selectedItems.length === 1
-    ? (selectedItems[0].name ?? String(selectedItems[0].vmid))
-    : "delete";
+    ? (selectedItems[0].name || String(selectedItems[0].vmid))
+    : t("common.delete");
 
   const handleOpenDelete = () => {
     setDeleteConfirmText("");
@@ -245,23 +186,22 @@ export default function ContainersPage() {
   };
 
   const runDelete = useCallback(async () => {
-    if (selectedItems.length === 0) return;
+    if (selectedItems.length === 0 || deleteConfirmText !== deleteConfirmPhrase) return;
 
     try {
       setActionLoading("delete");
-      const results = await Promise.all(
-        selectedItems.map(async (container) => {
-          const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${container.node}/lxc/${container.vmid}`, {
-            method: "DELETE",
-          });
-          return { container, upid };
-        }),
-      );
-
-      for (const { container, upid } of results) {
-        if (upid) {
-          trackTask(upid, container.node, `Delete container ${container.vmid} (${container.name ?? "unnamed"})`);
+      const results = await Promise.allSettled(selectedItems.map(async (container) => {
+        const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${encodeURIComponent(container.node)}/lxc/${container.vmid}`, { method: "DELETE" });
+        if (upid) trackTask(upid, container.node, `Delete ${container.vmid}`);
+      }));
+      const failedItems = selectedItems.filter((_, index) => results[index].status === "rejected");
+      if (failedItems.length) {
+        for (const [index, result] of results.entries()) {
+          if (result.status === "rejected") addError(`${selectedItems[index].vmid}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
         }
+        setSelectedItems(failedItems);
+        await loadContainers();
+        return;
       }
 
       setSelectedItems([]);
@@ -272,7 +212,7 @@ export default function ContainersPage() {
     } finally {
       setActionLoading(null);
     }
-  }, [loadContainers, selectedItems, trackTask, addError, t]);
+  }, [loadContainers, selectedItems, trackTask, addError, t, deleteConfirmText, deleteConfirmPhrase]);
 
   const columnDefinitions = useMemo<TableProps<PveContainer>["columnDefinitions"]>(
     () => [
@@ -360,6 +300,7 @@ export default function ContainersPage() {
             {t("containers.noContainersMatch")}
           </Box>
         </div>
+        {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
         <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
       </SpaceBetween>
     </Box>
@@ -408,14 +349,15 @@ export default function ContainersPage() {
 
   return (
     <SpaceBetween size="m">
+      <GuestPowerConfirmation action={pendingPowerAction} guests={selectedItems} busy={actionLoading !== null} onDismiss={() => setPendingPowerAction(null)} onConfirm={() => { if (pendingPowerAction) void runPowerAction(pendingPowerAction); }} />
       <Modal
         visible={showDeleteConfirm}
-        onDismiss={handleCloseDelete}
+        onDismiss={() => { if (!actionLoading) handleCloseDelete(); }}
         header={interpolate(t("containers.deleteContainersHeader"), { count: selectedItems.length, suffix: selectedItems.length > 1 ? "s" : "" })}
         footer={
           <Box float="right">
             <SpaceBetween size="xs" direction="horizontal">
-              <Button variant="link" onClick={handleCloseDelete}>{t("common.cancel")}</Button>
+              <Button disabled={!!actionLoading} variant="link" onClick={handleCloseDelete}>{t("common.cancel")}</Button>
                <Button
                  variant="normal"
                  loading={actionLoading === "delete"}
@@ -458,7 +400,8 @@ export default function ContainersPage() {
         items={items}
         selectionType="multi"
         selectedItems={selectedItems}
-        onSelectionChange={({ detail }) => setSelectedItems(detail.selectedItems)}
+        onSelectionChange={({ detail }) => { if (!actionLoading) setSelectedItems(detail.selectedItems); }}
+        isItemDisabled={() => actionLoading !== null}
         columnDefinitions={columnDefinitions}
         variant="full-page"
         stickyHeader
@@ -480,13 +423,16 @@ export default function ContainersPage() {
             description={t("containers.manageDescription")}
             actions={
               <SpaceBetween size="xs" direction="horizontal">
-                <Button loading={actionLoading === "start"} disabled={!canStart} onClick={() => void runPowerAction("start")}>
+                <Button loading={actionLoading === "start"} disabled={!canStart} onClick={() => requestPowerAction("start")}>
                   {t("containers.start")}
                 </Button>
-                <Button loading={actionLoading === "stop"} disabled={!canStop} onClick={() => void runPowerAction("stop")}>
+                <Button loading={actionLoading === "shutdown"} disabled={!canStop} onClick={() => requestPowerAction("shutdown")}>
+                  {t("nodeDetail.shutdown")}
+                </Button>
+                <Button loading={actionLoading === "stop"} disabled={!canStop} onClick={() => requestPowerAction("stop")}>
                   {t("containers.stop")}
                 </Button>
-                <Button loading={actionLoading === "reboot"} disabled={!canReboot} onClick={() => void runPowerAction("reboot")}>
+                <Button loading={actionLoading === "reboot"} disabled={!canReboot} onClick={() => requestPowerAction("reboot")}>
                   {t("containers.reboot")}
                 </Button>
                 <Button disabled={!canOpenConsole} onClick={() => router.push(`/containers/${selectedItems[0]?.vmid}/console`)}>

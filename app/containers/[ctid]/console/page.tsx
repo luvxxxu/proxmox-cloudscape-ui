@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -14,6 +14,7 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import ConsoleViewer from "@/app/components/console-viewer";
 import type { ConsoleMode, ConsoleSession } from "@/app/lib/console-session";
 import { useTranslation } from "@/app/lib/use-translation";
+import { apiFetch } from "@/app/lib/api-client";
 import { buildWsRelayUrl } from "@/app/lib/ws-relay-url";
 
 interface ClusterContainerResource {
@@ -26,8 +27,8 @@ interface ClusterContainerResource {
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected" | "error";
 
-async function fetchJson<T>(path: string, errorMessage: string): Promise<T> {
-  const res = await fetch(path, { cache: "no-store" });
+async function fetchJson<T>(path: string, errorMessage: string, signal: AbortSignal): Promise<T> {
+  const res = await apiFetch(path, { signal });
   if (!res.ok) throw new Error(errorMessage);
   const json = await res.json();
   return (json.data ?? json) as T;
@@ -35,6 +36,8 @@ async function fetchJson<T>(path: string, errorMessage: string): Promise<T> {
 
 export default function ContainerConsolePage() {
   const { t } = useTranslation();
+  const translation = useRef(t);
+  useEffect(() => { translation.current = t; }, [t]);
   const params = useParams<{ ctid: string }>();
   const router = useRouter();
   const [containerName, setContainerName] = useState<string | null>(null);
@@ -57,9 +60,12 @@ export default function ContainerConsolePage() {
   }, [t]);
 
   useEffect(() => {
-    if (!Number.isFinite(vmid)) return;
+    if (!Number.isSafeInteger(vmid) || vmid < 100 || vmid > 999999999) return;
 
     let cancelled = false;
+    const controller = new AbortController();
+    // A new external console connection must replace the previous session and status.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setStatus("connecting");
     setSession(null);
@@ -68,25 +74,28 @@ export default function ContainerConsolePage() {
       try {
         const resources = await fetchJson<ClusterContainerResource[]>(
           "/api/proxmox/cluster/resources?type=vm",
-          t("containers.failedRequest"),
+          translation.current("containers.failedRequest"),
+          controller.signal,
         );
 
         const resource = (resources ?? []).find(
           (r) => r.type === "lxc" && r.vmid === vmid && r.node,
         );
-        if (!resource?.node) throw new Error(t("containers.failedRequest"));
-        if (resource.status !== "running") throw new Error(t("containers.failedRequest"));
+        if (!resource?.node) throw new Error(translation.current("containers.failedRequest"));
+        if (resource.status !== "running") throw new Error(translation.current("containers.failedRequest"));
 
-        setContainerName(resource.name ?? null);
         if (cancelled) return;
+        setContainerName(resource.name ?? null);
 
-        const consoleRes = await fetch("/api/console", {
+        const consoleRes = await apiFetch("/api/console", {
           method: "POST",
+          signal: controller.signal,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ node: resource.node, vmid, vmtype: "lxc", mode }),
         });
-        if (!consoleRes.ok) throw new Error(t("console.failedToConnect"));
+        if (!consoleRes.ok) throw new Error(translation.current("console.failedToConnect"));
         const consoleData = await consoleRes.json();
+        if (cancelled) return;
         if (consoleData.error) throw new Error(consoleData.error);
 
         if (cancelled) return;
@@ -109,16 +118,16 @@ export default function ContainerConsolePage() {
         });
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : t("console.failedToConnect"));
+        setError(err instanceof Error ? err.message : translation.current("console.failedToConnect"));
         setStatus("error");
       }
     };
 
     void connect();
     return () => {
-      cancelled = true;
+      cancelled = true; controller.abort();
     };
-  }, [vmid, mode, attempt, t]);
+  }, [vmid, mode, attempt]);
 
   const title = containerName ? `${containerName} (${vmid})` : `CT ${vmid}`;
 
@@ -134,7 +143,7 @@ export default function ContainerConsolePage() {
 
   return (
     <SpaceBetween size="m">
-      {error && <Alert type="error" header={t("console.consoleError")}>{error}</Alert>}
+      {(error || !Number.isSafeInteger(vmid) || vmid < 100 || vmid > 999999999) && <Alert type="error" header={t("console.consoleError")}>{error || t("vms.vmIdInvalid")}</Alert>}
       <Header
         variant="h1"
         actions={

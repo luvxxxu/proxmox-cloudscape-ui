@@ -1,6 +1,12 @@
 "use client";
 
-import { type ReactNode, use, useCallback, useEffect, useMemo, useState } from "react";
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+import { GuestPowerConfirmation, type GuestPowerAction } from "@/app/lib/guest-power-confirmation";
+import { useSettings } from "@/app/components/settings-context";
+
+import { formatResourceBytes as formatBytes, isStorageActive, setOptionalParameters, isValidVmid, inferBackupGuestType } from "@/app/lib/resource-api";
+
+import { type ReactNode, use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
 import AreaChart from "@cloudscape-design/components/area-chart";
@@ -89,6 +95,8 @@ interface ClusterNextId {
 interface StorageSummary {
   storage: string;
   content?: string;
+  active?: number;
+  enabled?: number;
 }
 
 interface NetworkInterfaceRow {
@@ -161,6 +169,7 @@ interface BackupStorageSummary {
   storage: string;
   content?: string;
   active?: number;
+  enabled?: number;
   status?: string;
 }
 
@@ -170,6 +179,8 @@ interface ContainerBackupContent {
   size?: number;
   notes?: string;
   content?: string;
+  active?: number;
+  enabled?: number;
 }
 
 interface ContainerBackupRow {
@@ -211,13 +222,7 @@ const EMPTY_FIREWALL_RULE_FORM: ContainerFirewallRuleFormState = {
   enable: true,
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
+
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
@@ -307,9 +312,7 @@ function getTextValue(value?: string, fallback = "-") {
   return value?.trim() ? value : fallback;
 }
 
-function isStorageActive(storage: Pick<BackupStorageSummary, "active" | "status">) {
-  return storage.active === 1 || storage.status === "active" || storage.status === undefined;
-}
+
 
 function renderCenteredState(title: string, description: string, action?: ReactNode) {
   return (
@@ -344,7 +347,7 @@ function buildFirewallOptionsForm(options: ContainerFirewallOptions | null): Con
   return {
     enable: isEnabled(options?.enable),
     dhcp: isEnabled(options?.dhcp),
-    macfilter: isEnabled(options?.macfilter),
+    macfilter: isEnabled(options?.macfilter ?? 1),
     policyIn: options?.policy_in ?? "DROP",
     policyOut: options?.policy_out ?? "ACCEPT",
   };
@@ -364,7 +367,7 @@ function buildFirewallRuleForm(rule: ContainerFirewallRule | null): ContainerFir
 }
 
 function storageSupportsContent(storage: StorageSummary, contentType: string): boolean {
-  return (storage.content ?? "")
+  return isStorageActive(storage) && (storage.content ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .includes(contentType);
@@ -404,29 +407,24 @@ function getNetworkInterfaces(config: PveContainerConfig, yesLabel: string, noLa
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-  });
-
-  const json = (await response.json().catch(() => null)) as { data?: T | string } | null;
-
-  if (!response.ok) {
-    throw new Error(typeof json?.data === "string" ? json.data : `Request failed with status ${response.status}`);
-  }
-
-  return json?.data as T;
+  return requestResource<T>(path, init);
 }
 
 export default function ContainerDetailPage(props: { params: Promise<{ ctid: string }> }) {
+  const { ctid } = use(props.params);
+  return <ContainerDetails key={ctid} ctid={ctid} />;
+}
+
+function ContainerDetails({ ctid }: { ctid: string }) {
   const { t } = useTranslation();
   const router = useRouter();
-  const { ctid } = use(props.params);
+  const { confirmPowerActions } = useSettings();
+  const [pendingPowerAction, setPendingPowerAction] = useState<GuestPowerAction | null>(null);
   const vmid = Number(ctid);
   const [activeTabId, setActiveTabId] = useState("summary");
   const [data, setData] = useState<ContainerDetailData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState<"start" | "stop" | "reboot" | null>(null);
+  const [actionLoading, setActionLoading] = useState<GuestPowerAction | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [flashbarItems, setFlashbarItems] = useState<FlashbarProps.MessageDefinition[]>([]);
@@ -504,30 +502,57 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
   const yesLabel = t("network.yes");
   const noLabel = t("network.no");
 
+  const detailRequest = useRef<AbortController | null>(null);
+  const loadedNode = useRef<string | null>(null);
+
   const loadContainer = useCallback(async () => {
-    if (!Number.isFinite(vmid)) {
+    if (!isValidVmid(ctid)) {
       setLoadError(t("containers.invalidCtid"));
       setLoading(false);
       return;
     }
 
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
     try {
       setLoading(true);
       setActionError(null);
-      const resources = await fetchProxmox<PveResource[]>("/api/proxmox/cluster/resources?type=vm");
-      const resource = (resources ?? []).find((item) => item.vmid === vmid && item.type === "lxc") ?? (resources ?? []).find((item) => item.vmid === vmid);
+      const resources = await fetchProxmox<PveResource[]>("/api/proxmox/cluster/resources?type=vm", { signal: controller.signal });
+      const resource = (resources ?? []).find((item) => item.vmid === vmid && item.type === "lxc");
 
       if (!resource?.node) {
         throw new Error(`Container ${vmid} was not found`);
       }
 
       const [config, snapshots, tasks, rrd] = await Promise.all([
-        fetchProxmox<PveContainerConfig>(`/api/proxmox/nodes/${resource.node}/lxc/${vmid}/config`),
-        fetchProxmox<PveSnapshot[]>(`/api/proxmox/nodes/${resource.node}/lxc/${vmid}/snapshot`),
-        fetchProxmox<PveTask[]>(`/api/proxmox/nodes/${resource.node}/tasks?vmid=${vmid}&limit=20`),
-        fetchProxmox<PveRrdPoint[]>(`/api/proxmox/nodes/${resource.node}/lxc/${vmid}/rrddata?timeframe=hour&cf=AVERAGE`),
+        fetchProxmox<PveContainerConfig>(`/api/proxmox/nodes/${resource.node}/lxc/${vmid}/config`, { signal: controller.signal }),
+        fetchProxmox<PveSnapshot[]>(`/api/proxmox/nodes/${resource.node}/lxc/${vmid}/snapshot`, { signal: controller.signal }),
+        fetchProxmox<PveTask[]>(`/api/proxmox/nodes/${resource.node}/tasks?vmid=${vmid}&limit=20`, { signal: controller.signal }),
+        fetchProxmox<PveRrdPoint[]>(`/api/proxmox/nodes/${resource.node}/lxc/${vmid}/rrddata?timeframe=hour&cf=AVERAGE`, { signal: controller.signal }),
       ]);
 
+      if (controller.signal.aborted) return;
+      if (loadedNode.current !== resource.node) {
+        setDnsConfig(null);
+        setDnsInitialized(false);
+        setDnsError(null);
+        setFirewallRules([]);
+        setFirewallOptions(null);
+        setFirewallInitialized(false);
+        setFirewallRulesError(null);
+        setFirewallOptionsError(null);
+        setFirewallActionError(null);
+        setBackups([]);
+        setBackupsInitialized(false);
+        setBackupsError(null);
+        setBackupActionError(null);
+        setFirewallRulesLoading(false);
+        setFirewallOptionsLoading(false);
+        setBackupsLoading(false);
+        setDnsLoading(false);
+        loadedNode.current = resource.node;
+      }
       setData({
         resource,
         config: config ?? {},
@@ -537,14 +562,20 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       });
       setLoadError(null);
     } catch (fetchError) {
+      if (controller.signal.aborted) return;
       setLoadError(fetchError instanceof Error ? fetchError.message : t("containers.failedToLoadDetails"));
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
-  }, [t, vmid]);
+  }, [ctid, t, vmid]);
+
+  useResourceTaskRefresh(loadContainer);
 
   useEffect(() => {
+    // Start an external request; loading state belongs to its asynchronous lifecycle.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadContainer();
+    return () => detailRequest.current?.abort();
   }, [loadContainer]);
 
   const cloneModeOptions = useMemo<ReadonlyArray<SelectProps.Option>>(
@@ -580,22 +611,26 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
   }, []);
 
   const loadDnsConfig = useCallback(async () => {
+    setDnsInitialized(true);
     if (!data) {
       return;
     }
 
+    const requestNode = data.resource.node;
     try {
       setDnsLoading(true);
       const config = await fetchProxmox<PveContainerConfig>(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/config`);
+      if (loadedNode.current !== requestNode) return;
       setDnsConfig({
         nameserver: config?.nameserver,
         searchdomain: config?.searchdomain,
       });
       setDnsError(null);
     } catch (loadDnsError) {
+      if (loadedNode.current !== requestNode) return;
       setDnsError(loadDnsError instanceof Error ? loadDnsError.message : t("containers.failedToUpdateDns"));
     } finally {
-      setDnsLoading(false);
+      if (loadedNode.current === requestNode) setDnsLoading(false);
     }
   }, [data, t, vmid]);
 
@@ -604,15 +639,18 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       return;
     }
 
+    const requestNode = data.resource.node;
     try {
       setFirewallRulesLoading(true);
       const nextRules = await fetchProxmox<ContainerFirewallRule[]>(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/firewall/rules`);
+      if (loadedNode.current !== requestNode) return;
       setFirewallRules((nextRules ?? []).slice().sort((left, right) => left.pos - right.pos));
       setFirewallRulesError(null);
     } catch (loadRulesError) {
+      if (loadedNode.current !== requestNode) return;
       setFirewallRulesError(loadRulesError instanceof Error ? loadRulesError.message : t("containers.failedToLoadFirewallRules"));
     } finally {
-      setFirewallRulesLoading(false);
+      if (loadedNode.current === requestNode) setFirewallRulesLoading(false);
     }
   }, [data, t, vmid]);
 
@@ -621,27 +659,33 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       return;
     }
 
+    const requestNode = data.resource.node;
     try {
       setFirewallOptionsLoading(true);
       const nextOptions = await fetchProxmox<ContainerFirewallOptions>(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/firewall/options`);
+      if (loadedNode.current !== requestNode) return;
       setFirewallOptions(nextOptions ?? {});
       setFirewallOptionsError(null);
     } catch (loadOptionsError) {
+      if (loadedNode.current !== requestNode) return;
       setFirewallOptionsError(loadOptionsError instanceof Error ? loadOptionsError.message : t("containers.failedToLoadFirewallOptions"));
     } finally {
-      setFirewallOptionsLoading(false);
+      if (loadedNode.current === requestNode) setFirewallOptionsLoading(false);
     }
   }, [data, t, vmid]);
 
   const loadFirewallData = useCallback(async () => {
+    setFirewallInitialized(true);
     await Promise.all([loadFirewallRules(), loadFirewallOptions()]);
   }, [loadFirewallOptions, loadFirewallRules]);
 
   const loadBackups = useCallback(async () => {
+    setBackupsInitialized(true);
     if (!data) {
       return;
     }
 
+    const requestNode = data.resource.node;
     try {
       setBackupsLoading(true);
       const storages = await fetchProxmox<BackupStorageSummary[]>(`/api/proxmox/nodes/${data.resource.node}/storage`);
@@ -656,7 +700,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
           );
 
           return (entries ?? [])
-            .filter((entry) => entry.content === "backup" || entry.volid.includes("vzdump-"))
+            .filter((entry) => entry.content === "backup" || inferBackupGuestType(entry.volid) === "lxc")
             .map((entry) => ({
               id: `${storage}:${entry.volid}`,
               storage,
@@ -668,57 +712,36 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
         }),
       );
 
+      if (loadedNode.current !== requestNode) return;
       setBackups(backupLists.flat().sort((left, right) => (right.ctime ?? 0) - (left.ctime ?? 0)));
       setBackupsError(null);
     } catch (loadBackupsError) {
+      if (loadedNode.current !== requestNode) return;
       setBackupsError(loadBackupsError instanceof Error ? loadBackupsError.message : t("containers.failedToLoadBackups"));
     } finally {
-      setBackupsLoading(false);
+      if (loadedNode.current === requestNode) setBackupsLoading(false);
     }
   }, [data, t, vmid]);
 
-  const handlePowerAction = useCallback(
-    async (action: "start" | "stop" | "reboot") => {
-      if (!data) {
-        return;
-      }
+  const handlePowerAction = useCallback(async (action: GuestPowerAction) => {
+    if (!data) return;
+    try {
+      setActionLoading(action);
+      setActionError(null);
+      await fetchProxmox(`/api/proxmox/nodes/${encodeURIComponent(data.resource.node)}/lxc/${vmid}/status/${action}`, { method: "POST" });
+      await loadContainer();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : t("common.error"));
+    } finally {
+      setActionLoading(null);
+      setPendingPowerAction(null);
+    }
+  }, [data, loadContainer, vmid, t]);
 
-      const expectedStatus = action === "stop" ? "stopped" : "running";
-
-      try {
-        setActionLoading(action);
-        setActionError(null);
-        await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/status/${action}`, {
-          method: "POST",
-        });
-
-        for (let i = 0; i < 15; i++) {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          try {
-            const resources = await fetchProxmox<PveResource[]>("/api/proxmox/cluster/resources?type=vm");
-            const resource = (resources ?? []).find((item) => item.vmid === vmid && item.type === "lxc");
-            if (resource) {
-              const transitioned = action === "reboot"
-                ? resource.status === "running"
-                : resource.status === expectedStatus;
-
-              if (transitioned) {
-                await loadContainer();
-                break;
-              }
-            }
-          } catch {
-            void 0;
-          }
-        }
-      } catch (powerActionError) {
-        setActionError(powerActionError instanceof Error ? powerActionError.message : `Failed to ${action} container`);
-      } finally {
-        setActionLoading(null);
-      }
-    },
-    [data, loadContainer, vmid],
-  );
+  const requestPowerAction = (action: GuestPowerAction) => {
+    if (!confirmPowerActions && action !== "stop") void handlePowerAction(action);
+    else setPendingPowerAction(action);
+  };
 
   const openEditModal = useCallback(() => {
     if (!data) {
@@ -923,7 +946,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       setSnapshotLoading(true);
       setSnapshotError(null);
 
-      await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/snapshot/${selectedSnapshot.name}`, {
+      await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/snapshot/${encodeURIComponent(selectedSnapshot.name)}`, {
         method: "DELETE",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -959,7 +982,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       setSnapshotLoading(true);
       setSnapshotError(null);
 
-      await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/snapshot/${selectedSnapshot.name}/rollback`, {
+      await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/snapshot/${encodeURIComponent(selectedSnapshot.name)}/rollback`, {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -989,11 +1012,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
   useEffect(() => {
     const targetNode = optionValue(cloneTargetNode);
 
-    if (!cloneModalVisible || !targetNode) {
-      setAvailableStorages([]);
-      setCloneTargetStorage(null);
-      return;
-    }
+    if (!cloneModalVisible || !targetNode) return;
 
     let cancelled = false;
 
@@ -1030,21 +1049,6 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
     };
   }, [cloneModalVisible, cloneTargetNode, loadCloneStorages, t]);
 
-  useEffect(() => {
-    setDnsConfig(null);
-    setDnsInitialized(false);
-    setDnsError(null);
-    setFirewallRules([]);
-    setFirewallOptions(null);
-    setFirewallInitialized(false);
-    setFirewallRulesError(null);
-    setFirewallOptionsError(null);
-    setFirewallActionError(null);
-    setBackups([]);
-    setBackupsInitialized(false);
-    setBackupsError(null);
-    setBackupActionError(null);
-  }, [data?.resource.node, vmid]);
 
   useEffect(() => {
     if (!data) {
@@ -1052,17 +1056,16 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
     }
 
     if (activeTabId === "dns" && !dnsInitialized) {
-      setDnsInitialized(true);
+      // Load this resource tab once per node; explicit refresh remains available.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       void loadDnsConfig();
     }
 
     if (activeTabId === "firewall" && !firewallInitialized) {
-      setFirewallInitialized(true);
       void loadFirewallData();
     }
 
     if (activeTabId === "backup" && !backupsInitialized) {
-      setBackupsInitialized(true);
       void loadBackups();
     }
   }, [activeTabId, backupsInitialized, data, dnsInitialized, firewallInitialized, loadBackups, loadDnsConfig, loadFirewallData]);
@@ -1193,8 +1196,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       setDnsSaveLoading(true);
       setDnsError(null);
       const params = new URLSearchParams();
-      params.set("nameserver", dnsForm.nameserver.trim());
-      params.set("searchdomain", dnsForm.searchdomain.trim());
+      setOptionalParameters(params, { nameserver: dnsForm.nameserver, searchdomain: dnsForm.searchdomain }, true);
 
       await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/config`, {
         method: "PUT",
@@ -1262,11 +1264,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       params.set("type", firewallRuleForm.type || "in");
       params.set("action", firewallRuleForm.action || "ACCEPT");
       params.set("enable", firewallRuleForm.enable ? "1" : "0");
-      if (firewallRuleForm.proto.trim()) params.set("proto", firewallRuleForm.proto.trim());
-      if (firewallRuleForm.source.trim()) params.set("source", firewallRuleForm.source.trim());
-      if (firewallRuleForm.dest.trim()) params.set("dest", firewallRuleForm.dest.trim());
-      if (firewallRuleForm.dport.trim()) params.set("dport", firewallRuleForm.dport.trim());
-      if (firewallRuleForm.comment.trim()) params.set("comment", firewallRuleForm.comment.trim());
+      setOptionalParameters(params, { proto: firewallRuleForm.proto, source: firewallRuleForm.source, dest: firewallRuleForm.dest, dport: firewallRuleForm.dport, comment: firewallRuleForm.comment }, mode === "edit");
 
       const path = mode === "create"
         ? `/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/firewall/rules`
@@ -1433,11 +1431,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
         target: targetNode,
       });
 
-      if (data.resource.status === "running") {
-        body.set("online", migrateOnline ? "1" : "0");
-      } else {
-        body.set("restart", migrateOnline ? "1" : "0");
-      }
+      body.set("restart", migrateOnline ? "1" : "0");
 
       await fetchProxmox(`/api/proxmox/nodes/${data.resource.node}/lxc/${vmid}/migrate`, {
         method: "POST",
@@ -1475,7 +1469,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
     const targetStorage = optionValue(cloneTargetStorage);
     const fullClone = optionValue(cloneFullClone) !== "linked";
 
-    if (!newId) {
+    if (!isValidVmid(newId)) {
       setCloneError(t("containers.newIdRequired"));
       return;
     }
@@ -1745,7 +1739,7 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
       value: getConfigStringValue(config.hostname) || "-",
     },
   ];
-  const startDisabled = resource.status === "running" || actionLoading !== null;
+  const startDisabled = resource.status !== "stopped" || isEnabled(config.template as number | boolean | null | undefined) || actionLoading !== null;
   const stopDisabled = resource.status !== "running" || actionLoading !== null;
   const rebootDisabled = resource.status !== "running" || actionLoading !== null;
   const consoleDisabled = resource.status !== "running" || actionLoading !== null;
@@ -2096,7 +2090,8 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
 
   return (
     <SpaceBetween size="m">
-      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems} /> : null}
+      <GuestPowerConfirmation action={pendingPowerAction} guests={[{ vmid: vmid, name: resource.name }]} busy={actionLoading !== null} onDismiss={() => setPendingPowerAction(null)} onConfirm={() => { if (pendingPowerAction) void handlePowerAction(pendingPowerAction); }} />
+      {flashbarItems.length > 0 ? <Flashbar items={flashbarItems.map((item) => ({ ...item, dismissLabel: item.dismissLabel ?? t("common.close"), onDismiss: item.onDismiss ?? (() => setFlashbarItems((current) => current.filter((entry) => entry !== item))) }))} /> : null}
       {actionError ? (
         <Alert type="error" header={t("containers.failedRequest")} dismissible onDismiss={() => setActionError(null)}>
           {actionError}
@@ -2112,13 +2107,16 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
         description={`${t("containers.ctid")} ${vmid}`}
         actions={
           <SpaceBetween size="xs" direction="horizontal">
-            <Button loading={actionLoading === "start"} disabled={startDisabled} onClick={() => void handlePowerAction("start")}>
+            <Button loading={actionLoading === "start"} disabled={startDisabled} onClick={() => requestPowerAction("start")}>
               {t("containers.start")}
             </Button>
-            <Button loading={actionLoading === "stop"} disabled={stopDisabled} onClick={() => void handlePowerAction("stop")}>
+            <Button loading={actionLoading === "shutdown"} disabled={stopDisabled} onClick={() => requestPowerAction("shutdown")}>
+              {t("nodeDetail.shutdown")}
+            </Button>
+            <Button loading={actionLoading === "stop"} disabled={stopDisabled} onClick={() => requestPowerAction("stop")}>
               {t("containers.stop")}
             </Button>
-            <Button loading={actionLoading === "reboot"} disabled={rebootDisabled} onClick={() => void handlePowerAction("reboot")}>
+            <Button loading={actionLoading === "reboot"} disabled={rebootDisabled} onClick={() => requestPowerAction("reboot")}>
               {t("containers.reboot")}
             </Button>
             <Button disabled={actionLoading !== null} onClick={() => void openMigrateModal()}>
@@ -2184,10 +2182,10 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
             />
           </FormField>
           <Checkbox checked={migrateOnline} onChange={({ detail }) => setMigrateOnline(detail.checked)}>
-            {data.resource.status === "running" ? t("containers.onlineMigration") : t("containers.restartMigration")}
+            {t("containers.restartMigration")}
           </Checkbox>
           <Box color="text-body-secondary">
-            {data.resource.status === "running" ? t("containers.onlineMigrationDesc") : t("containers.restartMigrationDesc")}
+            {t("containers.restartMigrationDesc")}
           </Box>
         </SpaceBetween>
       </Modal>
@@ -2233,7 +2231,11 @@ export default function ContainerDetailPage(props: { params: Promise<{ ctid: str
           <FormField label={t("containers.targetNode")}>
             <Select
               selectedOption={cloneTargetNode}
-              onChange={({ detail }) => setCloneTargetNode(detail.selectedOption)}
+              onChange={({ detail }) => {
+                setCloneTargetNode(detail.selectedOption);
+                setCloneTargetStorage(null);
+                setAvailableStorages([]);
+              }}
               options={availableNodes}
               placeholder={t("containers.targetNode")}
               statusType={loadingNodes ? "loading" : "finished"}

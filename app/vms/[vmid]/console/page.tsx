@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Alert from "@cloudscape-design/components/alert";
 import Box from "@cloudscape-design/components/box";
@@ -18,6 +18,7 @@ import {
   type ConsoleSession,
 } from "@/app/lib/console-session";
 import { useTranslation } from "@/app/lib/use-translation";
+import { apiFetch } from "@/app/lib/api-client";
 import { buildWsRelayUrl } from "@/app/lib/ws-relay-url";
 
 interface ClusterVmResource {
@@ -30,8 +31,8 @@ interface ClusterVmResource {
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected" | "error";
 
-async function fetchJson<T>(path: string): Promise<T> {
-  const res = await fetch(path, { cache: "no-store" });
+async function fetchJson<T>(path: string, signal: AbortSignal): Promise<T> {
+  const res = await apiFetch(path, { signal });
   if (!res.ok) throw new Error(`Request failed: ${res.status}`);
   const json = await res.json();
   return (json.data ?? json) as T;
@@ -39,6 +40,8 @@ async function fetchJson<T>(path: string): Promise<T> {
 
 export default function VmConsolePage() {
   const { t } = useTranslation();
+  const translation = useRef(t);
+  useEffect(() => { translation.current = t; }, [t]);
   const params = useParams<{ vmid: string }>();
   const router = useRouter();
   const [vmName, setVmName] = useState<string | null>(null);
@@ -62,9 +65,12 @@ export default function VmConsolePage() {
   }, [t]);
 
   useEffect(() => {
-    if (!Number.isFinite(vmid)) return;
+    if (!Number.isSafeInteger(vmid) || vmid < 100 || vmid > 999999999) return;
 
     let cancelled = false;
+    const controller = new AbortController();
+    // A new external console connection must replace the previous session and status.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setStatus("connecting");
     setSession(null);
@@ -73,6 +79,7 @@ export default function VmConsolePage() {
       try {
         const resources = await fetchJson<ClusterVmResource[]>(
           "/api/proxmox/cluster/resources?type=vm",
+          controller.signal,
         );
 
         const resource = (resources ?? []).find(
@@ -81,13 +88,14 @@ export default function VmConsolePage() {
         if (!resource?.node) throw new Error(`VM ${vmid} not found`);
         if (resource.status !== "running") throw new Error(`VM ${vmid} is not running`);
 
-        setVmName(resource.name ?? null);
         if (cancelled) return;
+        setVmName(resource.name ?? null);
 
         let serialAvailable: boolean | null = null;
         try {
           const vmConfig = await fetchJson<Record<string, unknown>>(
             `/api/proxmox/nodes/${encodeURIComponent(resource.node)}/qemu/${vmid}/config`,
+            controller.signal,
           );
           serialAvailable = hasQemuSerialInterface(vmConfig);
         } catch {
@@ -102,19 +110,21 @@ export default function VmConsolePage() {
           return;
         }
 
-        const consoleRes = await fetch("/api/console", {
+        const consoleRes = await apiFetch("/api/console", {
           method: "POST",
+          signal: controller.signal,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ node: resource.node, vmid, vmtype: "qemu", mode }),
         });
         const consoleData = await consoleRes.json();
+        if (cancelled) return;
         if (consoleData.code === "SERIAL_INTERFACE_REQUIRED") {
           setXtermAvailable(false);
           setMode("novnc");
           return;
         }
         if (!consoleRes.ok || consoleData.error) {
-          throw new Error(consoleData.error ?? t("console.failedToConnect"));
+          throw new Error(consoleData.error ?? translation.current("console.failedToConnect"));
         }
 
         if (cancelled) return;
@@ -137,14 +147,14 @@ export default function VmConsolePage() {
         });
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : t("console.failedToConnect"));
+        setError(err instanceof Error ? err.message : translation.current("console.failedToConnect"));
         setStatus("error");
       }
     };
 
     void connect();
-    return () => { cancelled = true; };
-  }, [vmid, mode, attempt, t]);
+    return () => { cancelled = true; controller.abort(); };
+  }, [vmid, mode, attempt]);
 
   const title = vmName ? `${vmName} (${vmid})` : `${t("dashboard.virtualMachines")} ${vmid}`;
 
@@ -166,7 +176,7 @@ export default function VmConsolePage() {
 
   return (
     <SpaceBetween size="m">
-      {error && <Alert type="error" header={t("console.consoleError")}>{error}</Alert>}
+      {(error || !Number.isSafeInteger(vmid) || vmid < 100 || vmid > 999999999) && <Alert type="error" header={t("console.consoleError")}>{error || t("vms.vmIdInvalid")}</Alert>}
       <Header
         variant="h1"
         actions={

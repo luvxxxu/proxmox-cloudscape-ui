@@ -1,5 +1,11 @@
 "use client";
 
+import { requestResource, useResourceTaskRefresh } from "@/app/lib/resource-request";
+import { GuestPowerConfirmation, type GuestPowerAction } from "@/app/lib/guest-power-confirmation";
+import { useSettings } from "@/app/components/settings-context";
+
+import { formatResourceBytes as formatBytes } from "@/app/lib/resource-api";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCollection } from "@cloudscape-design/collection-hooks";
 import { useRouter } from "next/navigation";
@@ -21,13 +27,9 @@ import Input from "@cloudscape-design/components/input";
 import FormField from "@cloudscape-design/components/form-field";
 import { useTranslation } from "@/app/lib/use-translation";
 
-interface NodeSummary {
-  node: string;
-  status: "online" | "offline" | "unknown";
-}
-
 interface VmSummary {
   vmid: number;
+  template?: number;
   name?: string;
   node: string;
   status: string;
@@ -64,13 +66,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   ],
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
+
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
@@ -105,25 +101,13 @@ function interpolate(template: string, values: Record<string, string | number>) 
 }
 
 async function fetchProxmox<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
-  }
-
-  const json = (await response.json()) as { data?: T };
-  return json.data as T;
+  return requestResource<T>(path, init);
 }
 
 export default function VirtualMachinesPage() {
   const router = useRouter();
+  const { confirmPowerActions } = useSettings();
+  const [pendingPowerAction, setPendingPowerAction] = useState<GuestPowerAction | null>(null);
   const { t } = useTranslation();
   const { addError, trackTask } = useNotifications();
   const [vms, setVms] = useState<VmSummary[]>([]);
@@ -131,20 +115,13 @@ export default function VirtualMachinesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES);
-  const [actionLoading, setActionLoading] = useState<"start" | "stop" | "reboot" | "delete" | null>(null);
+  const [actionLoading, setActionLoading] = useState<GuestPowerAction | "delete" | null>(null);
 
   const loadVms = useCallback(async () => {
     try {
       setLoading(true);
-      const nodes = await fetchProxmox<NodeSummary[]>("/api/proxmox/nodes");
-      const onlineNodes = (nodes ?? []).filter((node) => node.status === "online");
-      const vmGroups = await Promise.all(
-        onlineNodes.map(async ({ node }) => {
-          const nodeVms = await fetchProxmox<Omit<VmSummary, "node">[]>(`/api/proxmox/nodes/${node}/qemu`);
-          return (nodeVms ?? []).map((vm) => ({ ...vm, node }));
-        }),
-      );
-      const nextVms = vmGroups.flat().sort((a, b) => a.vmid - b.vmid);
+      const resources = await fetchProxmox<Array<VmSummary & { type: string }>>("/api/proxmox/cluster/resources?type=vm");
+      const nextVms = (resources ?? []).filter((guest) => guest.type === "qemu").sort((a, b) => a.vmid - b.vmid);
 
       setVms(nextVms);
       setSelectedItems((current) => {
@@ -157,83 +134,49 @@ export default function VirtualMachinesPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
+
+  useResourceTaskRefresh(loadVms);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the external API request and its loading indicator when this view mounts.
     void loadVms();
   }, [loadVms]);
 
   const hasSelection = selectedItems.length > 0;
   const allStopped = hasSelection && selectedItems.every((vm) => vm.status === "stopped");
   const allRunning = hasSelection && selectedItems.every((vm) => vm.status === "running");
-  const canStart = allStopped && !actionLoading;
+  const canStart = allStopped && selectedItems.every((guest) => guest.template !== 1) && !actionLoading;
   const canStop = allRunning && !actionLoading;
   const canReboot = allRunning && !actionLoading;
   const canDelete = allStopped && !actionLoading;
   const canOpenConsole = selectedItems.length === 1 && selectedItems[0]?.status === "running" && !actionLoading;
 
-  const runPowerAction = useCallback(
-    async (action: "start" | "stop" | "reboot") => {
-      if (selectedItems.length === 0) return;
-      const expectedStatus = action === "stop" ? "stopped" : "running";
-      const targetVmids = new Set(selectedItems.map((vm) => vm.vmid));
-      try {
-        setActionLoading(action);
+  const runPowerAction = useCallback(async (action: GuestPowerAction) => {
+    if (!selectedItems.length) return;
+    setActionLoading(action);
+    const results = await Promise.allSettled(selectedItems.map(async (vm) => {
+      const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${encodeURIComponent(vm.node)}/qemu/${vm.vmid}/status/${action}`, { method: "POST" });
+      if (upid) trackTask(upid, vm.node, `${action} ${vm.vmid}`);
+    }));
+    const failures = results.flatMap((result, index) => result.status === "rejected" ? [`${selectedItems[index].vmid}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`] : []);
+    if (failures.length) addError(failures.join("; "));
+    setPendingPowerAction(null);
+    await loadVms();
+    setActionLoading(null);
+  }, [selectedItems, trackTask, addError, loadVms]);
 
-        const results = await Promise.all(
-          selectedItems.map(async (vm) => {
-            const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${vm.node}/qemu/${vm.vmid}/status/${action}`, {
-              method: "POST",
-              body: JSON.stringify({}),
-            });
-            return { vm, upid };
-          }),
-        );
-
-        for (const { vm, upid } of results) {
-          if (upid) {
-            trackTask(upid, vm.node, `${action} VM ${vm.vmid} (${vm.name ?? "unnamed"})`);
-          }
-        }
-
-        for (let i = 0; i < 10; i++) {
-          await new Promise((r) => setTimeout(r, 2000));
-          const nodes = await fetchProxmox<NodeSummary[]>("/api/proxmox/nodes");
-          const onlineNodes = (nodes ?? []).filter((n) => n.status === "online");
-          const vmGroups = await Promise.all(
-            onlineNodes.map(async ({ node }) => {
-              const nodeVms = await fetchProxmox<Omit<VmSummary, "node">[]>(`/api/proxmox/nodes/${node}/qemu`);
-              return (nodeVms ?? []).map((vm) => ({ ...vm, node }));
-            }),
-          );
-          const freshVms = vmGroups.flat().sort((a, b) => a.vmid - b.vmid);
-          const allTransitioned = freshVms
-            .filter((vm) => targetVmids.has(vm.vmid))
-            .every((vm) => action === "reboot" ? vm.status === "running" : vm.status === expectedStatus);
-
-          setVms(freshVms);
-          setSelectedItems((current) => {
-            const vmids = new Set(freshVms.map((vm) => vm.vmid));
-            return current.filter((vm) => vmids.has(vm.vmid)).map((vm) => freshVms.find((v) => v.vmid === vm.vmid)!);
-          });
-
-          if (allTransitioned) break;
-        }
-      } catch (actionError) {
-          addError(actionError instanceof Error ? actionError.message : interpolate(t("vms.failedAction"), { action }));
-      } finally {
-        setActionLoading(null);
-      }
-    },
-    [selectedItems, trackTask, addError],
-  );
+  const requestPowerAction = (action: GuestPowerAction) => {
+    if (!confirmPowerActions && action !== "stop") void runPowerAction(action);
+    else setPendingPowerAction(action);
+  };
 
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
 
   const deleteConfirmPhrase = selectedItems.length === 1
-    ? (selectedItems[0].name ?? String(selectedItems[0].vmid))
-    : "delete";
+    ? (selectedItems[0].name || String(selectedItems[0].vmid))
+    : t("common.delete");
 
   const handleOpenDelete = () => {
     setDeleteConfirmText("");
@@ -246,22 +189,21 @@ export default function VirtualMachinesPage() {
   };
 
   const runDelete = useCallback(async () => {
-    if (selectedItems.length === 0) return;
+    if (selectedItems.length === 0 || deleteConfirmText !== deleteConfirmPhrase) return;
     try {
       setActionLoading("delete");
-      const results = await Promise.all(
-        selectedItems.map(async (vm) => {
-          const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${vm.node}/qemu/${vm.vmid}`, {
-            method: "DELETE",
-          });
-          return { vm, upid };
-        }),
-      );
-
-      for (const { vm, upid } of results) {
-        if (upid) {
-          trackTask(upid, vm.node, `Delete VM ${vm.vmid} (${vm.name ?? "unnamed"})`);
+      const results = await Promise.allSettled(selectedItems.map(async (vm) => {
+        const upid = await fetchProxmox<string>(`/api/proxmox/nodes/${encodeURIComponent(vm.node)}/qemu/${vm.vmid}`, { method: "DELETE" });
+        if (upid) trackTask(upid, vm.node, `Delete ${vm.vmid}`);
+      }));
+      const failedItems = selectedItems.filter((_, index) => results[index].status === "rejected");
+      if (failedItems.length) {
+        for (const [index, result] of results.entries()) {
+          if (result.status === "rejected") addError(`${selectedItems[index].vmid}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
         }
+        setSelectedItems(failedItems);
+        await loadVms();
+        return;
       }
 
       setSelectedItems([]);
@@ -272,7 +214,7 @@ export default function VirtualMachinesPage() {
     } finally {
       setActionLoading(null);
     }
-  }, [loadVms, selectedItems, trackTask, addError]);
+  }, [loadVms, selectedItems, trackTask, addError, t, deleteConfirmText, deleteConfirmPhrase]);
 
   const columnDefinitions = useMemo<TableProps<VmSummary>["columnDefinitions"]>(
     () => [
@@ -360,6 +302,7 @@ export default function VirtualMachinesPage() {
             {t("vms.noVirtualMachinesMatch")}
           </Box>
         </div>
+        {/* eslint-disable-next-line react-hooks/immutability -- Cloudscape calls this event handler only after useCollection has returned its actions. */}
         <Button onClick={() => actions.setFiltering("")}>{t("common.clearFilter")}</Button>
       </SpaceBetween>
     </Box>
@@ -401,16 +344,17 @@ export default function VirtualMachinesPage() {
 
   return (
     <SpaceBetween size="m">
+      <GuestPowerConfirmation action={pendingPowerAction} guests={selectedItems} busy={actionLoading !== null} onDismiss={() => setPendingPowerAction(null)} onConfirm={() => { if (pendingPowerAction) void runPowerAction(pendingPowerAction); }} />
       <Modal
         visible={showDeleteConfirm}
-        onDismiss={handleCloseDelete}
+        onDismiss={() => { if (!actionLoading) handleCloseDelete(); }}
         header={interpolate(t("vms.deleteInstancesHeader"), { count: selectedItems.length, suffix: selectedItems.length > 1 ? "s" : "" })}
         footer={
           <Box float="right">
             <SpaceBetween size="xs" direction="horizontal">
-              <Button variant="link" onClick={handleCloseDelete}>{t("common.cancel")}</Button>
+              <Button disabled={!!actionLoading} variant="link" onClick={handleCloseDelete}>{t("common.cancel")}</Button>
                <Button
-                 variant="normal"
+                 variant="primary"
                  loading={actionLoading === "delete"}
                  disabled={deleteConfirmText !== deleteConfirmPhrase}
                  onClick={() => void runDelete()}
@@ -452,7 +396,8 @@ export default function VirtualMachinesPage() {
         {...collectionProps}
         items={items}
         selectedItems={selectedItems}
-        onSelectionChange={({ detail }) => setSelectedItems(detail.selectedItems)}
+        onSelectionChange={({ detail }) => { if (!actionLoading) setSelectedItems(detail.selectedItems); }}
+        isItemDisabled={() => actionLoading !== null}
         selectionType="multi"
         trackBy="vmid"
         columnDefinitions={columnDefinitions}
@@ -475,13 +420,16 @@ export default function VirtualMachinesPage() {
             counter={headerCounter}
             actions={
               <SpaceBetween size="xs" direction="horizontal">
-                <Button loading={actionLoading === "start"} disabled={!canStart} onClick={() => void runPowerAction("start")}>
+                <Button loading={actionLoading === "start"} disabled={!canStart} onClick={() => requestPowerAction("start")}>
                   {t("vms.start")}
                 </Button>
-                <Button loading={actionLoading === "stop"} disabled={!canStop} onClick={() => void runPowerAction("stop")}>
+                <Button loading={actionLoading === "shutdown"} disabled={!canStop} onClick={() => requestPowerAction("shutdown")}>
+                  {t("nodeDetail.shutdown")}
+                </Button>
+                <Button loading={actionLoading === "stop"} disabled={!canStop} onClick={() => requestPowerAction("stop")}>
                   {t("vms.stop")}
                 </Button>
-                <Button loading={actionLoading === "reboot"} disabled={!canReboot} onClick={() => void runPowerAction("reboot")}>
+                <Button loading={actionLoading === "reboot"} disabled={!canReboot} onClick={() => requestPowerAction("reboot")}>
                   {t("vms.reboot")}
                 </Button>
                 <Button disabled={!canOpenConsole} onClick={() => router.push(`/vms/${selectedItems[0]?.vmid}/console`)}>
