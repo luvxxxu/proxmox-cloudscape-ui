@@ -1,6 +1,6 @@
 {
   "name": "cloudscape-proxmox-ui",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "scripts": {
     "dev": "node server/custom-server.js",

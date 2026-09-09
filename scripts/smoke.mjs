@@ -112,6 +112,24 @@ try {
   await assertDesktopNavigation();
   assert(fixture.calls.some(call => call.path === '/access/roles' && call.params.privs === 'VM.Audit'), 'Role privileges must reach Proxmox');
   await captureDesktop('permissions-desktop.png');
+  await page.goto(`${origin}/vms/create`);
+  await page.getByLabel('VM Name', { exact: true }).fill('smoke-created-vm');
+  await page.getByRole('button', { name: /^Node\b/ }).click();
+  await page.getByRole('option', { name: 'pve', exact: true }).click();
+  await expect(page.getByLabel('VM ID', { exact: true })).toHaveValue('101');
+  // General, OS, system, CPU and memory lead to the storage/network step.
+  for (let step = 0; step < 5; step++) await page.getByRole('button', { name: 'Next', exact: true }).click();
+  await page.getByRole('button', { name: /^Storage\b/ }).click();
+  await page.getByRole('option', { name: 'local-lvm', exact: true }).click();
+  await page.getByRole('button', { name: /^Network Bridge\b/ }).click();
+  await page.getByRole('option', { name: 'vmbr0', exact: true }).click();
+  await page.getByRole('button', { name: 'Next', exact: true }).click();
+  await page.getByRole('button', { name: 'Next', exact: true }).click();
+  await page.getByRole('button', { name: 'Launch instance', exact: true }).click();
+  await page.waitForURL(`${origin}/vms`);
+  await page.getByText('smoke-created-vm', { exact: true }).waitFor();
+  const vmCreates = fixture.calls.filter(call => call.path === '/nodes/pve/qemu' && call.method === 'POST');
+  assert(vmCreates.length === 1 && vmCreates[0].params.vmid === '101' && vmCreates[0].params.net0.includes('bridge=vmbr0'), 'VM creation must reach Proxmox once with the selected settings');
   await page.goto(`${origin}/api-explorer`);
   await page.getByPlaceholder('Search users, Ceph, SDN, certificates, or paths').fill('/version');
   await page.getByRole('link', { name: '/version', exact: true }).click();
@@ -143,7 +161,7 @@ try {
   assert(errors.length === 0, `Browser errors: ${errors.join('\n')}`);
   rmSync(path.join(artifacts, 'failure.png'), { force: true });
   passed = true;
-  console.log(JSON.stringify({ ok: true, checks: ['production Node container', 'strict upstream TLS', 'anonymous API denial', 'HTTPS encrypted session', 'CSP hydration', 'desktop navigation visibility and toggle', 'navigation route changes', 'user creation', 'role creation', 'API operation', 'mobile navigation open and close', 'mobile overflow', 'browser console'], upstreamCalls: fixture.calls.length, artifacts }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ['production Node container', 'strict upstream TLS', 'anonymous API denial', 'HTTPS encrypted session', 'CSP hydration', 'desktop navigation visibility and toggle', 'navigation route changes', 'user creation', 'role creation', 'VM creation wizard against chunked-rejecting upstream', 'API operation', 'mobile navigation open and close', 'mobile overflow', 'browser console'], upstreamCalls: fixture.calls.length, artifacts }, null, 2));
 } finally {
   if (page && !passed) { await page.screenshot({ path: `${artifacts}/failure.png`, fullPage: true }).catch(() => {}); console.log((await page.locator("body").innerText().catch(() => "")).slice(-3000)); }
   await browser?.close();

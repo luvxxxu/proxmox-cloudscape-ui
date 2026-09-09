@@ -4,8 +4,16 @@ import { createServer } from 'node:https';
 export function createProxmoxFixture(tls) {
   const calls = [];
   const users = [{ userid: 'admin@pve', enable: 1, groups: 'admins', email: 'admin@example.test', tokens: [] }];
+  const guests = [{ id: 'qemu/100', type: 'qemu', vmid: 100, node: 'pve', name: 'Fixture VM', status: 'running', cpu: 0.05, maxcpu: 2, mem: 536870912, maxmem: 2147483648, disk: 1073741824, maxdisk: 21474836480 }];
   const roles = [{ roleid: 'Administrator', privs: 'Sys.Audit Sys.Modify Permissions.Modify User.Modify VM.Audit VM.Allocate VM.Console', special: 1 }, { roleid: 'PVEAuditor', privs: 'Sys.Audit VM.Audit', special: 1 }];
   const server = createServer(tls, async (request, response) => {
+    // Match pve-api-daemon: accepting chunked writes here hides gateway bugs.
+    if (request.headers['transfer-encoding']) {
+      response.writeHead(501, { 'content-type': 'text/plain' });
+      response.end('chunked transfer encoding not supported');
+      request.resume();
+      return;
+    }
     const url = new URL(request.url, 'https://fixture.test');
     const path = decodeURIComponent(url.pathname.replace('/api2/json', ''));
     let raw = '';
@@ -34,7 +42,14 @@ export function createProxmoxFixture(tls) {
     if (path === '/access/groups') return send([{ groupid: 'admins', users: 'admin@pve', comment: 'Fixture administrators' }]);
     if (path === '/access/acl' || path === '/access/tfa') return send([]);
     if (path === '/nodes') return send([{ node: 'pve', status: 'online', cpu: 0.1, maxcpu: 8, mem: 1073741824, maxmem: 8589934592, disk: 1073741824, maxdisk: 107374182400, uptime: 1000 }]);
-    if (path === '/cluster/resources') return send([{ id: 'qemu/100', type: 'qemu', vmid: 100, node: 'pve', name: 'Fixture VM', status: 'running', cpu: 0.05, maxcpu: 2, mem: 536870912, maxmem: 2147483648, disk: 1073741824, maxdisk: 21474836480 }]);
+    if (path === '/cluster/resources') return send(guests);
+    if (path === '/cluster/nextid') return send('101');
+    if (path === '/nodes/pve/storage') return send([{ storage: 'local-lvm', content: 'images,rootdir', active: 1, enabled: 1, type: 'lvmthin' }]);
+    if (path === '/nodes/pve/network') return send([{ iface: 'vmbr0', type: 'bridge', active: 1 }]);
+    if (path === '/nodes/pve/qemu' && request.method === 'POST') {
+      guests.push({ ...guests[0], id: `qemu/${params.get('vmid')}`, vmid: Number(params.get('vmid')), name: params.get('name'), status: 'stopped' });
+      return send('UPID:pve:00000001:00000001:00000001:qmcreate:101:admin@pve:');
+    }
     if (path.endsWith('/rrddata')) return send(Array.from({ length: 10 }, (_, i) => ({ time: 1788910000 + i * 60, cpu: i / 100, memused: 1073741824, memtotal: 8589934592, netin: 1000, netout: 2000 })));
     if (path.endsWith('/status')) return send({ status: 'stopped', exitstatus: 'OK' });
     if (path === '/cluster/options') return send({ keyboard: 'en-us', language: 'en' });

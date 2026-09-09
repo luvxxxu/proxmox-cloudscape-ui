@@ -51,7 +51,8 @@ describe('authenticated Proxmox gateway', () => {
     expect(options.headers.get('Authorization')).toBeNull();
     expect(options.headers.get('Cookie')).toBe('PVEAuthCookie=PVE:root@pam:auth');
     expect(options.headers.get('CSRFPreventionToken')).toBe('csrf');
-    expect(options.body).toBeInstanceOf(ReadableStream);
+    expect(options.headers.get('content-length')).toBe('2');
+    expect(new TextDecoder().decode(options.body)).toBe('{}');
   });
   it('streams binary data and preserves download metadata', async () => {
     const bytes = new Uint8Array([0, 255, 128, 42]);
